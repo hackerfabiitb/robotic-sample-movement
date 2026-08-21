@@ -4,33 +4,63 @@
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --line: #262b36;
-    --fg: #e6e9ef; --dim: #8b93a7; --accent: #5eead4; --warn: #fbbf24; --bad: #f87171;
+    --fg: #e6e9ef; --dim: #8b93a7; --accent: #5eead4; --warn: #fbbf24;
+    --bad: #f87171; --hot: #fb7185;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
-         font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-         display: grid; grid-template-columns: 340px 1fr; height: 100vh; }
+         font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         display: grid; grid-template-columns: 360px 1fr; height: 100vh; }
   #side { background: var(--panel); border-right: 1px solid var(--line);
           padding: 16px; overflow-y: auto; }
   #view { position: relative; }
   canvas { display: block; }
   h1 { font-size: 15px; margin: 0 0 4px; letter-spacing: .04em; }
-  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
-       color: var(--dim); margin: 22px 0 8px; font-weight: 600; }
-  #status { font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  h2 { font-size: 10px; text-transform: uppercase; letter-spacing: .12em;
+       color: var(--dim); margin: 20px 0 8px; font-weight: 600; }
+  #status { font-size: 12px; color: var(--dim); }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
          background: var(--bad); margin-right: 6px; vertical-align: middle; }
   .dot.on { background: var(--accent); }
+  .dot.run { background: var(--hot); }
   table { width: 100%; border-collapse: collapse; }
   td { padding: 3px 0; }
   td.k { color: var(--dim); }
   td.v { text-align: right; font-variant-numeric: tabular-nums; }
-  .xyz td.v { font-size: 20px; color: var(--accent); }
+  .xyz td.v { font-size: 19px; color: var(--accent); }
   .bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 2px; }
   .bar > i { display: block; height: 100%; background: var(--accent);
              border-radius: 2px; transition: width .06s linear; }
-  #err { color: var(--warn); font-size: 12px; margin-top: 10px; white-space: pre-wrap; }
+  button { font: inherit; background: #222735; color: var(--fg);
+           border: 1px solid var(--line); border-radius: 5px;
+           padding: 7px 10px; cursor: pointer; }
+  button:hover:not(:disabled) { background: #2b3242; border-color: #39415280; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: #14514a; border-color: #1c6d63; color: #b8fff4; }
+  button.danger { background: #4b1f26; border-color: #6d2b35; color: #ffc9cf; }
+  .row { display: flex; gap: 6px; margin-bottom: 6px; }
+  .row > * { flex: 1; }
+  #wps { margin: 0; padding: 0; list-style: none; }
+  #wps li { display: flex; align-items: center; gap: 6px; padding: 5px 6px;
+            border: 1px solid var(--line); border-radius: 5px; margin-bottom: 4px;
+            background: #12151c; }
+  #wps li.active { border-color: var(--hot); background: #2a1a20; }
+  #wps .nm { color: var(--accent); width: 34px; flex: none; }
+  #wps .co { color: var(--dim); flex: 1; font-size: 11px; }
+  #wps input { width: 46px; background: #0d1016; color: var(--fg); text-align: right;
+               border: 1px solid var(--line); border-radius: 4px; padding: 2px 4px;
+               font: inherit; font-size: 11px; }
+  #wps .del { flex: none; padding: 2px 7px; font-size: 12px; line-height: 1.2; }
+  #empty { color: var(--dim); font-size: 11px; padding: 6px 0; }
+  #log { background: #0d1016; border: 1px solid var(--line); border-radius: 5px;
+         padding: 8px; height: 120px; overflow-y: auto; font-size: 11px;
+         color: var(--dim); white-space: pre-wrap; }
+  #err { color: var(--warn); font-size: 11px; margin-top: 8px; white-space: pre-wrap; }
   #hint { position: absolute; bottom: 12px; left: 14px; color: var(--dim); font-size: 11px; }
+  #banner { position: absolute; top: 0; left: 0; right: 0; padding: 7px;
+            text-align: center; background: var(--hot); color: #1a0d10;
+            font-weight: 700; letter-spacing: .06em; display: none; }
+  #banner.on { display: block; }
 </style>
 
 <div id="side">
@@ -45,34 +75,101 @@
     <tr><td class="k">Z</td><td class="v" id="z">-</td></tr>
   </table>
 
+  <h2>Waypoints</h2>
+  <div class="row">
+    <button id="capture" class="primary">+ capture here</button>
+    <button id="clear" class="danger" style="flex:0 0 70px">clear</button>
+  </div>
+  <ul id="wps"></ul>
+  <div id="empty">Back-drive the arm by hand, then capture. The number on the
+    right is the gripper value used at that point (0 shut, 100 open).</div>
+
+  <h2>Playback</h2>
+  <div class="row">
+    <label class="k" style="flex:0 0 60px; align-self:center">cycles</label>
+    <input id="cycles" type="number" value="1" min="1" max="99"
+           style="background:#0d1016;color:var(--fg);border:1px solid var(--line);
+                  border-radius:4px;padding:4px 6px;font:inherit;text-align:right">
+  </div>
+  <div class="row">
+    <button id="run" class="primary">run (torque ON)</button>
+    <button id="abort" class="danger" disabled>stop</button>
+  </div>
+
   <h2>Joints (deg)</h2>
   <table id="joints"></table>
 
-  <h2>Rate</h2>
-  <table><tr><td class="k">updates</td><td class="v" id="hz">-</td></tr></table>
+  <h2>Log</h2>
+  <div id="log"></div>
 </div>
 
-<div id="view"><div id="hint">drag to orbit &middot; scroll to zoom</div></div>
+<div id="view">
+  <div id="banner">TORQUE ON &mdash; ARM IS MOVING</div>
+  <div id="hint">drag to orbit &middot; scroll to zoom</div>
+</div>
 
 <script type="module">
 import * as THREE from './vendor/three.module.js';
 
-// Joint travel limits, for the little range bars. Mirrors the URDF.
 const LIMITS = {
   shoulder_pan: [-110, 110], shoulder_lift: [-100, 100], elbow_flex: [-96.8, 96.8],
   wrist_flex: [-95, 95], wrist_roll: [-157.2, 162.8], gripper: [0, 100],
 };
 const ORDER = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
 
+const post = (body) => fetch('/api', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+});
+
 // ---------- sidebar ----------
 const jointsTable = document.getElementById('joints');
 const rows = {};
 for (const name of ORDER) {
   const tr = document.createElement('tr');
-  const label = name.replace('_', ' ');
-  tr.innerHTML = '<td class="k">' + label + '<div class="bar"><i></i></div></td><td class="v">-</td>';
+  tr.innerHTML = '<td class="k">' + name.replace('_', ' ') +
+                 '<div class="bar"><i></i></div></td><td class="v">-</td>';
   jointsTable.appendChild(tr);
   rows[name] = { value: tr.querySelector('.v'), bar: tr.querySelector('.bar > i') };
+}
+
+document.getElementById('capture').onclick = () => post({ action: 'capture' });
+document.getElementById('clear').onclick = () => {
+  if (confirm('Delete all waypoints?')) post({ action: 'clear' });
+};
+document.getElementById('run').onclick = () => {
+  const cycles = parseInt(document.getElementById('cycles').value, 10) || 1;
+  if (confirm('This turns torque ON and moves the arm. Clear of obstructions?')) {
+    post({ action: 'run', cycles });
+  }
+};
+document.getElementById('abort').onclick = () => post({ action: 'abort' });
+
+// Rebuild the waypoint list only when it actually changes -- otherwise a 30 Hz
+// stream would blow away whatever the user is typing in a gripper field.
+let wpSignature = '';
+const wpsEl = document.getElementById('wps');
+function renderWaypoints(wps, activeIndex) {
+  const sig = JSON.stringify(wps);
+  if (sig !== wpSignature) {
+    wpSignature = sig;
+    wpsEl.innerHTML = '';
+    for (let i = 0; i < wps.length; i++) {
+      const w = wps[i];
+      const li = document.createElement('li');
+      const xyz = w.xyz.map(v => v.toFixed(3)).join('  ');
+      li.innerHTML =
+        '<span class="nm">' + w.name + '</span>' +
+        '<span class="co">' + xyz + '</span>' +
+        '<input type="number" min="0" max="100" step="1" value="' + w.gripper + '">' +
+        '<button class="del">x</button>';
+      li.querySelector('.del').onclick = () => post({ action: 'delete', index: i });
+      li.querySelector('input').onchange = (e) =>
+        post({ action: 'set_gripper', index: i, value: parseFloat(e.target.value) });
+      wpsEl.appendChild(li);
+    }
+    document.getElementById('empty').style.display = wps.length ? 'none' : 'block';
+  }
+  [...wpsEl.children].forEach((li, i) => li.classList.toggle('active', i === activeIndex));
 }
 
 // ---------- three.js scene ----------
@@ -96,42 +193,59 @@ function resize() {
 }
 addEventListener('resize', resize);
 
-// Ground grid on the XY plane -- the table the arm is bolted to.
 const grid = new THREE.GridHelper(1, 20, 0x2a3040, 0x1c2130);
 grid.rotation.x = Math.PI / 2;
 scene.add(grid);
 scene.add(new THREE.AxesHelper(0.1));
 
-// The arm: one polyline through the joint origins, plus a ball at each.
+function polyline(n, color, width) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+  const l = new THREE.Line(g, new THREE.LineBasicMaterial({ color, linewidth: width || 1 }));
+  scene.add(l);
+  return g;
+}
+
 const N = 7;
-const linkGeom = new THREE.BufferGeometry();
-linkGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
-scene.add(new THREE.Line(linkGeom, new THREE.LineBasicMaterial({ color: 0x5eead4 })));
+const linkGeom = polyline(N, 0x5eead4);
+const fixedJawGeom = polyline(2, 0x93c5fd);   // static finger, part of gripper_link
+const movingJawGeom = polyline(3, 0xfbbf24);  // pivots on the `gripper` joint
+const dropGeom = polyline(2, 0x3d4557);
 
 const joints3d = [];
 for (let i = 0; i < N; i++) {
-  const isTip = i === N - 1;
-  const m = new THREE.Mesh(
-    new THREE.SphereGeometry(isTip ? 0.016 : 0.011, 16, 12),
-    new THREE.MeshBasicMaterial({ color: isTip ? 0xfbbf24 : 0x9aa4bf }));
+  const m = new THREE.Mesh(new THREE.SphereGeometry(0.011, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0x9aa4bf }));
   scene.add(m);
   joints3d.push(m);
 }
+// Tool point sits between the jaws -- the thing IK actually targets.
+const tcpBall = new THREE.Mesh(new THREE.SphereGeometry(0.008, 16, 12),
+  new THREE.MeshBasicMaterial({ color: 0x5eead4 }));
+scene.add(tcpBall);
 
-// Vertical drop line from the tool to the table, so height reads at a glance.
-const dropGeom = new THREE.BufferGeometry();
-dropGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(2 * 3), 3));
-scene.add(new THREE.Line(dropGeom, new THREE.LineBasicMaterial({ color: 0x3d4557 })));
-
-// A short trail of where the tool has recently been.
 const TRAIL = 150;
 const trailPts = [];
-const trailGeom = new THREE.BufferGeometry();
-trailGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TRAIL * 3), 3));
+const trailGeom = polyline(TRAIL, 0x2f6f66);
 trailGeom.setDrawRange(0, 0);
-scene.add(new THREE.Line(trailGeom, new THREE.LineBasicMaterial({ color: 0x2f6f66 })));
 
-// ---------- minimal orbit control (so we need not vendor OrbitControls too) ----------
+// Waypoint markers.
+let markers = [];
+function renderMarkers(wps, activeIndex) {
+  while (markers.length > wps.length) scene.remove(markers.pop());
+  while (markers.length < wps.length) {
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.009, 12, 10),
+      new THREE.MeshBasicMaterial({ color: 0xfb7185, transparent: true, opacity: 0.85 }));
+    scene.add(m);
+    markers.push(m);
+  }
+  wps.forEach((w, i) => {
+    markers[i].position.set(w.xyz[0], w.xyz[1], w.xyz[2]);
+    markers[i].scale.setScalar(i === activeIndex ? 1.7 : 1);
+  });
+}
+
+// ---------- minimal orbit control ----------
 let theta = -0.9, phi = 1.1, radius = 0.85, dragging = false, px = 0, py = 0;
 function applyCamera() {
   camera.position.set(
@@ -159,18 +273,48 @@ renderer.domElement.addEventListener('wheel', e => {
 const dot = document.getElementById('dot');
 const statusText = document.getElementById('statustext');
 const errEl = document.getElementById('err');
-let ticks = 0, lastHz = performance.now();
+const banner = document.getElementById('banner');
+const logEl = document.getElementById('log');
+let lastLog = '';
+
+function setPoints(geom, pts) {
+  const a = geom.attributes.position;
+  for (let i = 0; i < pts.length; i++) a.setXYZ(i, pts[i][0], pts[i][1], pts[i][2]);
+  a.needsUpdate = true;
+  geom.setDrawRange(0, pts.length);
+  geom.computeBoundingSphere();
+}
 
 function update(s) {
   if (s.error) {
     errEl.textContent = s.error;
-    dot.classList.remove('on');
+    dot.className = 'dot';
     statusText.textContent = 'error';
     return;
   }
   errEl.textContent = '';
-  dot.classList.toggle('on', !!s.connected);
-  statusText.textContent = s.connected ? 'live - torque off' : 'connecting...';
+
+  const running = s.mode === 'running';
+  dot.className = 'dot ' + (running ? 'run' : (s.connected ? 'on' : ''));
+  statusText.textContent = running ? 'RUNNING - torque ON'
+    : (s.connected ? 'monitor - torque off, back-drivable' : 'connecting...');
+  banner.classList.toggle('on', running);
+  document.getElementById('run').disabled = running || !(s.waypoints || []).length;
+  document.getElementById('abort').disabled = !running;
+  document.getElementById('capture').disabled = running;
+
+  if (s.log && s.log.length) {
+    const joined = s.log.join('\n');
+    if (joined !== lastLog) {
+      lastLog = joined;
+      logEl.textContent = joined;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+  }
+
+  renderWaypoints(s.waypoints || [], s.running_index);
+  renderMarkers(s.waypoints || [], s.running_index);
+
   if (!s.skeleton) return;
 
   document.getElementById('x').textContent = s.xyz[0].toFixed(4);
@@ -186,45 +330,25 @@ function update(s) {
     rows[name].bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
   }
 
-  const pos = linkGeom.attributes.position;
-  for (let i = 0; i < s.skeleton.length; i++) {
-    const p = s.skeleton[i];
-    pos.setXYZ(i, p[0], p[1], p[2]);
-    joints3d[i].position.set(p[0], p[1], p[2]);
-  }
-  pos.needsUpdate = true;
-  linkGeom.computeBoundingSphere();
+  setPoints(linkGeom, s.skeleton);
+  s.skeleton.forEach((p, i) => joints3d[i].position.set(p[0], p[1], p[2]));
 
-  const tip = s.skeleton[s.skeleton.length - 1];
-  const dp = dropGeom.attributes.position;
-  dp.setXYZ(0, tip[0], tip[1], tip[2]);
-  dp.setXYZ(1, tip[0], tip[1], 0);
-  dp.needsUpdate = true;
-  dropGeom.computeBoundingSphere();
+  if (s.jaw_fixed) setPoints(fixedJawGeom, s.jaw_fixed);
+  if (s.jaw_moving) setPoints(movingJawGeom, s.jaw_moving);
+
+  const tip = s.xyz;
+  tcpBall.position.set(tip[0], tip[1], tip[2]);
+  setPoints(dropGeom, [tip, [tip[0], tip[1], 0]]);
 
   trailPts.push(tip);
   if (trailPts.length > TRAIL) trailPts.shift();
-  const tp = trailGeom.attributes.position;
-  for (let i = 0; i < trailPts.length; i++) {
-    tp.setXYZ(i, trailPts[i][0], trailPts[i][1], trailPts[i][2]);
-  }
-  tp.needsUpdate = true;
-  trailGeom.setDrawRange(0, trailPts.length);
-  trailGeom.computeBoundingSphere();
-
-  ticks++;
-  const now = performance.now();
-  if (now - lastHz > 500) {
-    document.getElementById('hz').textContent = (ticks * 1000 / (now - lastHz)).toFixed(0) + ' Hz';
-    ticks = 0;
-    lastHz = now;
-  }
+  setPoints(trailGeom, trailPts);
 }
 
 const es = new EventSource('/events');
 es.onmessage = e => update(JSON.parse(e.data));
 es.onerror = () => {
-  dot.classList.remove('on');
+  dot.className = 'dot';
   statusText.textContent = 'stream lost - is server.py running?';
 };
 

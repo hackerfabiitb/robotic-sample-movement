@@ -134,6 +134,55 @@ class SO101Kinematics:
             frames.append((j["child"], T[:3, 3].copy()))
         return frames
 
+    def gripper_geometry(self, q_deg, gripper_norm: float) -> dict[str, list[np.ndarray]]:
+        """Segments for drawing both jaws, given the 0-100 gripper value.
+
+        The URDF has no separate link for the fixed jaw -- it is part of
+        `gripper_link`'s mesh -- so the static finger is drawn as gripper_link's
+        origin out to the tool point. The moving jaw pivots on the `gripper`
+        joint; its length comes from that link's centre of mass sitting at
+        y = -0.030 in its own frame, i.e. a bar of roughly twice that.
+
+        lerobot's 0-100 maps linearly onto the URDF's joint limits. Checked
+        numerically: at the lower limit the jaw tip sits ~25mm from the tool
+        point (closed) and at the upper limit ~120mm (open), which matches
+        0 = closed / 100 = open.
+        """
+        if not isinstance(q_deg, dict):
+            q_deg = dict(zip(ARM_JOINTS, np.asarray(q_deg, dtype=float)))
+
+        T = np.eye(4)
+        T_tip_local = np.eye(4)
+        for jname in self.chain:
+            j = self.joints[jname]
+            if j["child"] == TIP_LINK:
+                T_tip_local = j["T"]
+                break
+            T = T @ j["T"]
+            if j["type"] == "revolute":
+                a = np.radians(q_deg.get(jname, 0.0))
+                c, s = np.cos(a), np.sin(a)
+                Rz = np.eye(4)
+                Rz[:3, :3] = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+                T = T @ Rz
+
+        origin = T[:3, 3].copy()
+        tcp = (T @ T_tip_local)[:3, 3]
+
+        gj = self.joints["gripper"]
+        lo, hi = gj["limits"]
+        angle = lo + (float(np.clip(gripper_norm, 0.0, 100.0)) / 100.0) * (hi - lo)
+        c, s = np.cos(angle), np.sin(angle)
+        Rz = np.eye(4)
+        Rz[:3, :3] = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        T_jaw = T @ gj["T"] @ Rz
+
+        pivot = T_jaw[:3, 3].copy()
+        tip = (T_jaw @ np.array([0.0, -0.058, 0.019, 1.0]))[:3]
+        knuckle = (T_jaw @ np.array([0.0, 0.0, 0.019, 1.0]))[:3]
+
+        return {"fixed": [origin, tcp], "moving": [pivot, knuckle, tip]}
+
     def jacobian(self, q_deg: np.ndarray, eps: float = 1e-6) -> np.ndarray:
         """Numeric position Jacobian, 3x5, in metres per RADIAN.
 

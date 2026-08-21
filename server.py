@@ -1,23 +1,28 @@
-r"""Live web GUI for the SO-101: stream joint state and pose to a browser.
+r"""Live web GUI for the SO-101: monitor it, record waypoints, and play them back.
 
     .venv\python.exe server.py
 
 Then open http://localhost:8000
 
-Torque is DISABLED while this runs, so you can back-drive the arm by hand and
-watch the readout follow. Nothing here ever commands a position -- it is a
-read-only monitor, which is what makes it safe to leave running.
+Two modes, and the arm is only ever stiff in one of them:
 
-Transport is Server-Sent Events over the standard library's http.server. The
-data only flows one way, so SSE avoids pulling in a websocket dependency, and
-forward kinematics stays in Python -- the browser just draws the points it is
-given rather than duplicating the URDF maths in JavaScript.
+  monitor  torque OFF. Back-drive the arm by hand, watch the readout follow,
+           and hit "capture" to record wherever it currently is.
+  running  torque ON. The arm plays the recorded waypoints back.
+
+Only one thread ever touches the robot. A serial port is exclusive, so the
+poller owns the connection and the HTTP handlers hand it commands through a
+queue rather than opening the port themselves.
+
+Forward kinematics stays in Python: the browser is sent the already-computed 3D
+position of every joint origin plus both gripper jaws, and simply draws them.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import queue
 import sys
 import threading
 import time
@@ -31,11 +36,48 @@ import arm
 from kinematics import ARM_JOINTS, SO101Kinematics
 
 WEB_DIR = Path(__file__).parent / "web"
+WAYPOINT_FILE = Path(__file__).parent / "waypoints.json"
 
-# Shared between the poller thread and the request handlers.
-_state: dict = {"connected": False, "error": None, "seq": 0}
+# Motion tuning for playback.
+T_TRAVEL = 3.0
+T_GRIPPER = 1.0
+GRIP_SETTLE = 0.4
+RAMP_RATE = 30.0
+MAX_STEP = 12.0
+
+_state: dict = {
+    "connected": False,
+    "error": None,
+    "mode": "starting",
+    "seq": 0,
+    "waypoints": [],
+    "log": [],
+    "running_index": None,
+}
 _state_lock = threading.Lock()
+_commands: queue.Queue = queue.Queue()
 _stop = threading.Event()
+_abort = threading.Event()
+
+
+def log(msg: str) -> None:
+    with _state_lock:
+        _state["log"] = (_state["log"] + [msg])[-40:]
+        _state["seq"] += 1
+    print(msg)
+
+
+def load_waypoints() -> list[dict]:
+    if WAYPOINT_FILE.exists():
+        try:
+            return json.loads(WAYPOINT_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+
+def save_waypoints(wps: list[dict]) -> None:
+    WAYPOINT_FILE.write_text(json.dumps(wps, indent=2))
 
 
 def port_busy_hint(port: str, e: Exception) -> str:
@@ -60,8 +102,94 @@ def port_busy_hint(port: str, e: Exception) -> str:
     ])
 
 
+def publish(robot, kin: SO101Kinematics, mode: str, running_index=None) -> dict[str, float]:
+    """Read the arm once and push joints, tool pose and skeleton to the UI."""
+    joints = arm.read_joints(robot)
+    q = arm.arm_vector(joints)
+    frames = kin.fk_frames(q)
+    jaws = kin.gripper_geometry(q, joints.get("gripper", 0.0))
+
+    with _state_lock:
+        _state.update(
+            connected=True,
+            joints={k: round(v, 3) for k, v in joints.items()},
+            xyz=[round(float(v), 5) for v in frames[-1][1]],
+            skeleton=[[round(float(c), 5) for c in p] for _, p in frames],
+            jaw_fixed=[[round(float(c), 5) for c in p] for p in jaws["fixed"]],
+            jaw_moving=[[round(float(c), 5) for c in p] for p in jaws["moving"]],
+            mode=mode,
+            running_index=running_index,
+            seq=_state["seq"] + 1,
+            t=time.time(),
+        )
+    return joints
+
+
+def ramp(robot, kin, target: dict[str, float], duration: float, index=None) -> None:
+    """Interpolate to `target`, publishing state as it goes so the UI animates."""
+    start = arm.read_joints(robot)
+    goal = dict(start)
+    goal.update({k: v for k, v in target.items() if k in start})
+
+    n = max(1, int(duration * RAMP_RATE))
+    period = 1.0 / RAMP_RATE
+    for i in range(1, n + 1):
+        if _abort.is_set():
+            return
+        a = arm.smoothstep(i / n)
+        robot.send_action({f"{k}.pos": start[k] + (v - start[k]) * a for k, v in goal.items()})
+        publish(robot, kin, "running", index)
+        time.sleep(period)
+    time.sleep(0.3)
+
+
+def run_sequence(robot, kin: SO101Kinematics, waypoints: list[dict], cycles: int) -> None:
+    """Play the recorded waypoints back with torque on."""
+    if not waypoints:
+        log("nothing to run -- capture some waypoints first")
+        return
+
+    # Check every target is solvable before making the arm stiff.
+    for i, wp in enumerate(waypoints):
+        _, _, err = kin.ik(np.array(wp["xyz"]), q_init=np.zeros(5))
+        if err > 0.005:
+            log(f"ABORT: waypoint {i + 1} is unreachable (off by {err * 1000:.0f} mm)")
+            return
+
+    log(f"torque ON -- running {len(waypoints)} waypoints x{cycles}")
+    robot.bus.enable_torque()
+    # Assert the present pose before anything else, so enabling torque cannot
+    # snap the arm toward a stale goal left in the servos.
+    robot.send_action({f"{k}.pos": v for k, v in arm.read_joints(robot).items()})
+    time.sleep(0.1)
+
+    try:
+        for c in range(1, cycles + 1):
+            for i, wp in enumerate(waypoints):
+                if _abort.is_set():
+                    log("aborted")
+                    return
+                joints = arm.read_joints(robot)
+                q, _, err = kin.ik(np.array(wp["xyz"]), q_init=arm.arm_vector(joints))
+                if err > 0.005:
+                    log(f"ABORT: waypoint {i + 1} unreachable from here")
+                    return
+                label = wp.get("name") or f"waypoint {i + 1}"
+                log(f"cycle {c}/{cycles}: -> {label}")
+                ramp(robot, kin, dict(zip(ARM_JOINTS, q)), T_TRAVEL, i)
+
+                if wp.get("gripper") is not None:
+                    log(f"    gripper -> {wp['gripper']:.0f}")
+                    ramp(robot, kin, {"gripper": float(wp["gripper"])}, T_GRIPPER, i)
+                    time.sleep(GRIP_SETTLE)
+        log("sequence complete")
+    finally:
+        robot.bus.disable_torque()
+        log("torque OFF -- back-drivable again")
+
+
 def poll_arm(port: str, robot_id: str, rate: float) -> None:
-    """Read the arm forever, publishing joint angles, tool pose and skeleton."""
+    """Own the robot: monitor continuously, and execute queued commands."""
     kin = SO101Kinematics()
     robot = None
     try:
@@ -82,35 +210,31 @@ def poll_arm(port: str, robot_id: str, rate: float) -> None:
             return
 
         try:
-            robot = arm.connect(port, robot_id)
+            robot = arm.connect(port, robot_id, max_step=MAX_STEP)
         except Exception as e:
             raise RuntimeError(port_busy_hint(port, e)) from e
-        # Read-only monitor: let go of the joints so they can be moved by hand.
-        robot.bus.disable_torque()
 
+        robot.bus.disable_torque()
         with _state_lock:
-            _state["connected"] = True
+            _state["waypoints"] = load_waypoints()
             _state["error"] = None
+        log("connected -- torque OFF, arm is back-drivable")
 
         period = 1.0 / rate
         while not _stop.is_set():
             t0 = time.perf_counter()
-            joints = arm.read_joints(robot)
-            q = arm.arm_vector(joints)
-            frames = kin.fk_frames(q)
-            tip = frames[-1][1]
 
-            with _state_lock:
-                _state.update(
-                    joints={k: round(v, 3) for k, v in joints.items()},
-                    xyz=[round(float(v), 5) for v in tip],
-                    skeleton=[[round(float(c), 5) for c in p] for _, p in frames],
-                    links=[n for n, _ in frames],
-                    seq=_state["seq"] + 1,
-                    t=time.time(),
-                )
+            try:
+                cmd = _commands.get_nowait()
+            except queue.Empty:
+                cmd = None
+
+            if cmd is not None:
+                handle_command(cmd, robot, kin)
+
+            publish(robot, kin, "monitor")
             time.sleep(max(0.0, period - (time.perf_counter() - t0)))
-    except Exception as e:  # surface it in the UI rather than dying silently
+    except Exception as e:
         with _state_lock:
             _state["error"] = f"{type(e).__name__}: {e}"
             _state["connected"] = False
@@ -122,6 +246,70 @@ def poll_arm(port: str, robot_id: str, rate: float) -> None:
                 pass
         with _state_lock:
             _state["connected"] = False
+            _state["mode"] = "stopped"
+
+
+def handle_command(cmd: dict, robot, kin: SO101Kinematics) -> None:
+    action = cmd.get("action")
+
+    if action == "capture":
+        joints = arm.read_joints(robot)
+        xyz = kin.fk_position(arm.arm_vector(joints))
+        with _state_lock:
+            wps = list(_state["waypoints"])
+        wps.append({
+            "name": cmd.get("name") or f"p{len(wps) + 1}",
+            "xyz": [round(float(v), 5) for v in xyz],
+            "gripper": round(float(joints.get("gripper", 0.0)), 1),
+        })
+        save_waypoints(wps)
+        with _state_lock:
+            _state["waypoints"] = wps
+        log(f"captured {wps[-1]['name']} at {np.round(xyz, 4).tolist()} grip {wps[-1]['gripper']:.0f}")
+
+    elif action == "delete":
+        i = int(cmd.get("index", -1))
+        with _state_lock:
+            wps = list(_state["waypoints"])
+        if 0 <= i < len(wps):
+            removed = wps.pop(i)
+            save_waypoints(wps)
+            with _state_lock:
+                _state["waypoints"] = wps
+            log(f"deleted {removed['name']}")
+
+    elif action == "clear":
+        save_waypoints([])
+        with _state_lock:
+            _state["waypoints"] = []
+        log("cleared all waypoints")
+
+    elif action == "set_gripper":
+        with _state_lock:
+            wps = list(_state["waypoints"])
+        i = int(cmd.get("index", -1))
+        if 0 <= i < len(wps):
+            wps[i]["gripper"] = float(cmd.get("value", 50.0))
+            save_waypoints(wps)
+            with _state_lock:
+                _state["waypoints"] = wps
+            log(f"{wps[i]['name']} gripper set to {wps[i]['gripper']:.0f}")
+
+    elif action == "run":
+        _abort.clear()
+        with _state_lock:
+            wps = list(_state["waypoints"])
+        try:
+            run_sequence(robot, kin, wps, int(cmd.get("cycles", 1)))
+        except Exception as e:
+            log(f"run failed: {type(e).__name__}: {e}")
+            try:
+                robot.bus.disable_torque()
+            except Exception:
+                pass
+        finally:
+            with _state_lock:
+                _state["running_index"] = None
 
 
 class QuietServer(ThreadingHTTPServer):
@@ -155,9 +343,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self) -> None:
+        if self.path.split("?")[0] != "/api":
+            self._send(404, b"not found", "text/plain")
+            return
+        n = int(self.headers.get("Content-Length", 0))
+        try:
+            cmd = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            self._send(400, b'{"ok":false}', "application/json")
+            return
+
+        # "abort" must not queue behind a running sequence -- it has to land now.
+        if cmd.get("action") == "abort":
+            _abort.set()
+        else:
+            _commands.put(cmd)
+        self._send(200, b'{"ok":true}', "application/json")
+
     def do_GET(self) -> None:
         path = self.path.split("?")[0]
-
         if path == "/":
             self._send(200, (WEB_DIR / "index.html").read_bytes(), "text/html; charset=utf-8")
         elif path == "/vendor/three.module.js":
@@ -209,7 +414,6 @@ def main() -> int:
     httpd = QuietServer(("127.0.0.1", args.http_port), Handler)
     url = f"http://localhost:{args.http_port}"
     print(f"serving {url}")
-    print("torque is OFF -- move the arm by hand and watch it follow")
     print("Ctrl+C to stop")
     if not args.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
@@ -220,8 +424,9 @@ def main() -> int:
         print("\nstopping")
     finally:
         _stop.set()
+        _abort.set()
         httpd.shutdown()
-        poller.join(timeout=3.0)
+        poller.join(timeout=5.0)
     return 0
 
 

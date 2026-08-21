@@ -293,41 +293,74 @@ than drive the gripper into the table.
 python server.py
 ```
 
-Opens <http://localhost:8000> with a live readout of the tool position and joint
-angles, plus a three.js stick figure of the arm. **Torque is disabled while it
-runs**, so you can back-drive the arm by hand and watch the display follow.
+Opens <http://localhost:8000>. Two modes, and the arm is stiff in only one:
 
-It is strictly read-only -- nothing in it ever commands a position, which is what
-makes it safe to leave running while you work.
+| Mode | Torque | What you do |
+| --- | --- | --- |
+| **monitor** (default) | **off** | Back-drive the arm by hand; the readout and 3D view follow. Hit **capture** to record where it is. |
+| **running** | **on** | The arm plays the recorded waypoints back. A red banner shows across the view the whole time. |
 
-```
-python server.py --http-port 8080 --rate 60 --no-browser
-```
+It always returns to monitor with torque off when a run ends, aborts, or fails.
+
+### Recording and playing a sequence
+
+1. Move the gripper by hand to where you want a point.
+2. **+ capture here** records the tool XYZ *and the current gripper value*.
+3. Repeat. Edit any waypoint's gripper number in the list, or delete it.
+4. Set **cycles**, then **run (torque ON)**. **stop** aborts mid-motion.
+
+Playback visits each waypoint in order, then sets the gripper to that waypoint's
+value. So "open at p1, close at p1, move to p2, open" is just four captures of
+the same two places with different gripper numbers -- no special pick/place mode.
+
+Waypoints persist to `waypoints.json`, so they survive a restart.
+
+Every waypoint is IK-checked **before** torque is enabled, so an unreachable
+point aborts while the arm is still limp.
+
+### Gripper rendering
+
+Both jaws are drawn: the **fixed** jaw in blue and the **moving** jaw in amber.
+
+The URDF has no separate link for the fixed jaw -- it is part of `gripper_link`'s
+mesh -- so it is drawn as that link's origin out to the tool point. The moving
+jaw pivots on the real `gripper` joint; its length comes from that link's centre
+of mass sitting at `y = -0.030` in its own frame, i.e. a bar of about twice that.
+
+lerobot's 0-100 gripper value maps linearly onto the URDF's joint limits. Checked
+numerically, the jaw tip travels 25mm from the tool point at 0 to 120mm at 100 --
+confirming 0 = closed, 100 = open, which matches the arm's behaviour.
 
 ### How it fits together
 
-No new dependencies -- it is standard library plus a vendored copy of three.js.
+No new dependencies -- standard library plus a vendored copy of three.js.
 
-- **Transport is Server-Sent Events** over `http.server`. Data only flows one
-  way (Python to browser), so SSE does the job without a websocket library.
-- **Forward kinematics stays in Python.** The server sends the browser the
-  already-computed 3D position of every joint origin via
-  `SO101Kinematics.fk_frames()`, and the page just draws lines between them.
-  Nothing about the URDF is reimplemented in JavaScript.
-- **three.js is vendored** at [web/vendor/three.module.js](web/vendor/) rather
-  than pulled from a CDN, so the GUI works at a bench with no internet. It is
-  ~1.3 MB, which is the bulk of this repo.
-- Orbit control is a ~20-line pointer handler rather than another vendored file.
-- The camera is set `up = (0,0,1)`: the URDF is Z-up and three.js defaults to Y-up.
+- **Transport** is Server-Sent Events for the live stream (Python to browser) and
+  plain `POST /api` for commands the other way. One-way streaming plus occasional
+  commands does not justify a websocket library.
+- **One thread owns the robot.** A serial port is exclusive, so the poller holds
+  the connection and HTTP handlers hand it commands through a `queue`. Playback
+  runs *inside* that thread, publishing state as it interpolates, which is why
+  the 3D view animates during a run.
+- **`abort` bypasses the queue** and sets an `Event` directly -- queued behind a
+  running sequence, a stop button would be useless.
+- **Forward kinematics stays in Python.** The browser receives already-computed
+  3D points for the skeleton and both jaws, and just draws them. Nothing about
+  the URDF is reimplemented in JavaScript.
+- **three.js is vendored** at [web/vendor/](web/vendor/) rather than pulled from
+  a CDN, so the GUI works at a bench with no internet. It is ~1.3 MB, the bulk of
+  this repo. Orbit control is a ~20-line pointer handler rather than another
+  vendored file.
+- The camera is set `up = (0,0,1)`: the URDF is Z-up, three.js defaults to Y-up.
+- The waypoint list only re-renders when it actually changes -- rebuilding it at
+  30 Hz would wipe out whatever you were typing in a gripper field.
 
-Measured: the arm reads at **~650 Hz** over the serial bus, so the 30 Hz default
-stream rate has enormous headroom. `--rate` raises it if you want.
+Measured: the arm reads at **~650 Hz** over serial, so the 30 Hz default stream
+has plenty of headroom. `--rate` raises it.
 
-### Using it to set pick-and-place waypoints
-
-This is the easy way to fill in `POSITIONS` in [pick_place.py](pick_place.py):
-start the server, physically move the gripper to where you want a waypoint, and
-read X/Y/Z straight off the panel.
+```powershell
+python server.py --http-port 8080 --rate 60 --no-browser
+```
 
 ## Troubleshooting
 
