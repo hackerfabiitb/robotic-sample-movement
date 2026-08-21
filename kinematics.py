@@ -111,6 +111,29 @@ class SO101Kinematics:
     def fk_position(self, q_deg) -> np.ndarray:
         return self.fk(q_deg)[:3, 3]
 
+    def fk_frames(self, q_deg) -> list[tuple[str, np.ndarray]]:
+        """Origin of every link along the chain, for drawing a stick figure.
+
+        Returns [(link_name, xyz), ...] starting at the base and ending at the
+        tool point. Consecutive entries are the segments to draw.
+        """
+        if not isinstance(q_deg, dict):
+            q_deg = dict(zip(ARM_JOINTS, np.asarray(q_deg, dtype=float)))
+
+        frames = [(BASE_LINK, np.zeros(3))]
+        T = np.eye(4)
+        for jname in self.chain:
+            j = self.joints[jname]
+            T = T @ j["T"]
+            if j["type"] == "revolute":
+                q = np.radians(q_deg.get(jname, 0.0))
+                Rz = np.eye(4)
+                c, s = np.cos(q), np.sin(q)
+                Rz[:3, :3] = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+                T = T @ Rz
+            frames.append((j["child"], T[:3, 3].copy()))
+        return frames
+
     def jacobian(self, q_deg: np.ndarray, eps: float = 1e-6) -> np.ndarray:
         """Numeric position Jacobian, 3x5, in metres per RADIAN.
 

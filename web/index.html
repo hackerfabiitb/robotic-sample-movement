@@ -1,0 +1,234 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SO-101 Monitor</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36;
+    --fg: #e6e9ef; --dim: #8b93a7; --accent: #5eead4; --warn: #fbbf24; --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         display: grid; grid-template-columns: 340px 1fr; height: 100vh; }
+  #side { background: var(--panel); border-right: 1px solid var(--line);
+          padding: 16px; overflow-y: auto; }
+  #view { position: relative; }
+  canvas { display: block; }
+  h1 { font-size: 15px; margin: 0 0 4px; letter-spacing: .04em; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
+       color: var(--dim); margin: 22px 0 8px; font-weight: 600; }
+  #status { font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         background: var(--bad); margin-right: 6px; vertical-align: middle; }
+  .dot.on { background: var(--accent); }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 3px 0; }
+  td.k { color: var(--dim); }
+  td.v { text-align: right; font-variant-numeric: tabular-nums; }
+  .xyz td.v { font-size: 20px; color: var(--accent); }
+  .bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 2px; }
+  .bar > i { display: block; height: 100%; background: var(--accent);
+             border-radius: 2px; transition: width .06s linear; }
+  #err { color: var(--warn); font-size: 12px; margin-top: 10px; white-space: pre-wrap; }
+  #hint { position: absolute; bottom: 12px; left: 14px; color: var(--dim); font-size: 11px; }
+</style>
+
+<div id="side">
+  <h1>SO-101 Monitor</h1>
+  <div id="status"><span class="dot" id="dot"></span><span id="statustext">connecting...</span></div>
+  <div id="err"></div>
+
+  <h2>Tool position (m)</h2>
+  <table class="xyz">
+    <tr><td class="k">X</td><td class="v" id="x">-</td></tr>
+    <tr><td class="k">Y</td><td class="v" id="y">-</td></tr>
+    <tr><td class="k">Z</td><td class="v" id="z">-</td></tr>
+  </table>
+
+  <h2>Joints (deg)</h2>
+  <table id="joints"></table>
+
+  <h2>Rate</h2>
+  <table><tr><td class="k">updates</td><td class="v" id="hz">-</td></tr></table>
+</div>
+
+<div id="view"><div id="hint">drag to orbit &middot; scroll to zoom</div></div>
+
+<script type="module">
+import * as THREE from './vendor/three.module.js';
+
+// Joint travel limits, for the little range bars. Mirrors the URDF.
+const LIMITS = {
+  shoulder_pan: [-110, 110], shoulder_lift: [-100, 100], elbow_flex: [-96.8, 96.8],
+  wrist_flex: [-95, 95], wrist_roll: [-157.2, 162.8], gripper: [0, 100],
+};
+const ORDER = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
+
+// ---------- sidebar ----------
+const jointsTable = document.getElementById('joints');
+const rows = {};
+for (const name of ORDER) {
+  const tr = document.createElement('tr');
+  const label = name.replace('_', ' ');
+  tr.innerHTML = '<td class="k">' + label + '<div class="bar"><i></i></div></td><td class="v">-</td>';
+  jointsTable.appendChild(tr);
+  rows[name] = { value: tr.querySelector('.v'), bar: tr.querySelector('.bar > i') };
+}
+
+// ---------- three.js scene ----------
+const view = document.getElementById('view');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f1115);
+
+// The URDF is Z-up; three.js defaults to Y-up, so tell the camera which way is up.
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
+camera.up.set(0, 0, 1);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+view.appendChild(renderer.domElement);
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+
+// Ground grid on the XY plane -- the table the arm is bolted to.
+const grid = new THREE.GridHelper(1, 20, 0x2a3040, 0x1c2130);
+grid.rotation.x = Math.PI / 2;
+scene.add(grid);
+scene.add(new THREE.AxesHelper(0.1));
+
+// The arm: one polyline through the joint origins, plus a ball at each.
+const N = 7;
+const linkGeom = new THREE.BufferGeometry();
+linkGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+scene.add(new THREE.Line(linkGeom, new THREE.LineBasicMaterial({ color: 0x5eead4 })));
+
+const joints3d = [];
+for (let i = 0; i < N; i++) {
+  const isTip = i === N - 1;
+  const m = new THREE.Mesh(
+    new THREE.SphereGeometry(isTip ? 0.016 : 0.011, 16, 12),
+    new THREE.MeshBasicMaterial({ color: isTip ? 0xfbbf24 : 0x9aa4bf }));
+  scene.add(m);
+  joints3d.push(m);
+}
+
+// Vertical drop line from the tool to the table, so height reads at a glance.
+const dropGeom = new THREE.BufferGeometry();
+dropGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(2 * 3), 3));
+scene.add(new THREE.Line(dropGeom, new THREE.LineBasicMaterial({ color: 0x3d4557 })));
+
+// A short trail of where the tool has recently been.
+const TRAIL = 150;
+const trailPts = [];
+const trailGeom = new THREE.BufferGeometry();
+trailGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TRAIL * 3), 3));
+trailGeom.setDrawRange(0, 0);
+scene.add(new THREE.Line(trailGeom, new THREE.LineBasicMaterial({ color: 0x2f6f66 })));
+
+// ---------- minimal orbit control (so we need not vendor OrbitControls too) ----------
+let theta = -0.9, phi = 1.1, radius = 0.85, dragging = false, px = 0, py = 0;
+function applyCamera() {
+  camera.position.set(
+    radius * Math.sin(phi) * Math.cos(theta),
+    radius * Math.sin(phi) * Math.sin(theta),
+    radius * Math.cos(phi));
+  camera.lookAt(0, 0, 0.12);
+}
+renderer.domElement.addEventListener('pointerdown', e => { dragging = true; px = e.clientX; py = e.clientY; });
+addEventListener('pointerup', () => { dragging = false; });
+addEventListener('pointermove', e => {
+  if (!dragging) return;
+  theta -= (e.clientX - px) * 0.008;
+  phi = Math.min(Math.PI - 0.05, Math.max(0.05, phi - (e.clientY - py) * 0.008));
+  px = e.clientX; py = e.clientY;
+  applyCamera();
+});
+renderer.domElement.addEventListener('wheel', e => {
+  e.preventDefault();
+  radius = Math.min(3, Math.max(0.2, radius * (1 + Math.sign(e.deltaY) * 0.1)));
+  applyCamera();
+}, { passive: false });
+
+// ---------- live data ----------
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('statustext');
+const errEl = document.getElementById('err');
+let ticks = 0, lastHz = performance.now();
+
+function update(s) {
+  if (s.error) {
+    errEl.textContent = s.error;
+    dot.classList.remove('on');
+    statusText.textContent = 'error';
+    return;
+  }
+  errEl.textContent = '';
+  dot.classList.toggle('on', !!s.connected);
+  statusText.textContent = s.connected ? 'live - torque off' : 'connecting...';
+  if (!s.skeleton) return;
+
+  document.getElementById('x').textContent = s.xyz[0].toFixed(4);
+  document.getElementById('y').textContent = s.xyz[1].toFixed(4);
+  document.getElementById('z').textContent = s.xyz[2].toFixed(4);
+
+  for (const name of ORDER) {
+    const v = s.joints[name];
+    if (v === undefined) continue;
+    rows[name].value.textContent = v.toFixed(2);
+    const lim = LIMITS[name];
+    const pct = ((v - lim[0]) / (lim[1] - lim[0])) * 100;
+    rows[name].bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+  }
+
+  const pos = linkGeom.attributes.position;
+  for (let i = 0; i < s.skeleton.length; i++) {
+    const p = s.skeleton[i];
+    pos.setXYZ(i, p[0], p[1], p[2]);
+    joints3d[i].position.set(p[0], p[1], p[2]);
+  }
+  pos.needsUpdate = true;
+  linkGeom.computeBoundingSphere();
+
+  const tip = s.skeleton[s.skeleton.length - 1];
+  const dp = dropGeom.attributes.position;
+  dp.setXYZ(0, tip[0], tip[1], tip[2]);
+  dp.setXYZ(1, tip[0], tip[1], 0);
+  dp.needsUpdate = true;
+  dropGeom.computeBoundingSphere();
+
+  trailPts.push(tip);
+  if (trailPts.length > TRAIL) trailPts.shift();
+  const tp = trailGeom.attributes.position;
+  for (let i = 0; i < trailPts.length; i++) {
+    tp.setXYZ(i, trailPts[i][0], trailPts[i][1], trailPts[i][2]);
+  }
+  tp.needsUpdate = true;
+  trailGeom.setDrawRange(0, trailPts.length);
+  trailGeom.computeBoundingSphere();
+
+  ticks++;
+  const now = performance.now();
+  if (now - lastHz > 500) {
+    document.getElementById('hz').textContent = (ticks * 1000 / (now - lastHz)).toFixed(0) + ' Hz';
+    ticks = 0;
+    lastHz = now;
+  }
+}
+
+const es = new EventSource('/events');
+es.onmessage = e => update(JSON.parse(e.data));
+es.onerror = () => {
+  dot.classList.remove('on');
+  statusText.textContent = 'stream lost - is server.py running?';
+};
+
+resize();
+applyCamera();
+renderer.setAnimationLoop(() => renderer.render(scene, camera));
+</script>

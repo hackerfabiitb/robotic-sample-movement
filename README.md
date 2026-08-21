@@ -287,6 +287,48 @@ To measure it: back-drive the arm so the gripper sits where you want it, then ru
 `0.04` is deliberately on the high side -- it will miss a short object rather
 than drive the gripper into the table.
 
+## Live web GUI
+
+```powershell
+python server.py
+```
+
+Opens <http://localhost:8000> with a live readout of the tool position and joint
+angles, plus a three.js stick figure of the arm. **Torque is disabled while it
+runs**, so you can back-drive the arm by hand and watch the display follow.
+
+It is strictly read-only -- nothing in it ever commands a position, which is what
+makes it safe to leave running while you work.
+
+```
+python server.py --http-port 8080 --rate 60 --no-browser
+```
+
+### How it fits together
+
+No new dependencies -- it is standard library plus a vendored copy of three.js.
+
+- **Transport is Server-Sent Events** over `http.server`. Data only flows one
+  way (Python to browser), so SSE does the job without a websocket library.
+- **Forward kinematics stays in Python.** The server sends the browser the
+  already-computed 3D position of every joint origin via
+  `SO101Kinematics.fk_frames()`, and the page just draws lines between them.
+  Nothing about the URDF is reimplemented in JavaScript.
+- **three.js is vendored** at [web/vendor/three.module.js](web/vendor/) rather
+  than pulled from a CDN, so the GUI works at a bench with no internet. It is
+  ~1.3 MB, which is the bulk of this repo.
+- Orbit control is a ~20-line pointer handler rather than another vendored file.
+- The camera is set `up = (0,0,1)`: the URDF is Z-up and three.js defaults to Y-up.
+
+Measured: the arm reads at **~650 Hz** over the serial bus, so the 30 Hz default
+stream rate has enormous headroom. `--rate` raises it if you want.
+
+### Using it to set pick-and-place waypoints
+
+This is the easy way to fill in `POSITIONS` in [pick_place.py](pick_place.py):
+start the server, physically move the gripper to where you want a waypoint, and
+read X/Y/Z straight off the panel.
+
 ## Troubleshooting
 
 **Nothing responds to `scan_bus.py`, but the COM port exists.** The port comes
@@ -306,6 +348,21 @@ motors — they're all colliding on address 1. Proceed with step 3.
 An `[RxPacketError] Overload error!` on id 6 means it stalled -- back the
 target off rather than raising the limits.
 
+**`Could not connect on port 'COM3'` / `ConnectionError` on startup.** The port
+exists but is already held by another process -- usually an earlier `server.py`
+still running in another terminal. Serial ports are exclusive on Windows, so the
+second opener is simply refused. lerobot's message tells you to run
+`lerobot-find-port`, which sends you after the wrong problem. Find the holder:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name LIKE '%python%'" |
+    Select-Object ProcessId, CommandLine
+Stop-Process -Id <pid> -Force
+```
+
+Note that `pkill` from Git Bash does **not** reliably kill these -- use
+`Stop-Process`. `server.py` now detects this case and prints the above.
+
 **Torch/CUDA.** On Windows pip installs the default wheel. LeRobot falls back to
 `pyav` for video decoding, so a separate ffmpeg install isn't required.
 
@@ -321,3 +378,5 @@ target off rather than raising the limits.
 | [arm.py](arm.py) | Shared connect / read / interpolated-move helpers |
 | [move_ee.py](move_ee.py) | Cartesian tool moves and gripper control |
 | [pick_place.py](pick_place.py) | Shuttle an object between configured positions |
+| [server.py](server.py) | Live web GUI server (read-only, torque off) |
+| [web/index.html](web/index.html) | three.js front end for the monitor |
