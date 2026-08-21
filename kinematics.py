@@ -41,6 +41,66 @@ def rpy_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
     ])
 
 
+def rot_log(R: np.ndarray) -> np.ndarray:
+    """Rotation matrix -> rotation vector (axis * angle), the SO(3) logarithm.
+
+    Used as the orientation error term in pose IK: it is the smallest rotation
+    that carries the current orientation onto the target, expressed as a plain
+    3-vector so it stacks directly under the position error.
+    """
+    c = (np.trace(R) - 1.0) / 2.0
+    angle = np.arccos(np.clip(c, -1.0, 1.0))
+    if angle < 1e-9:
+        return np.zeros(3)
+    if angle > np.pi - 1e-6:
+        # Near 180 deg the skew part vanishes; recover the axis from R + I.
+        A = (R + np.eye(3)) / 2.0
+        axis = np.sqrt(np.clip(np.diag(A), 0.0, None))
+        k = int(np.argmax(axis))
+        if axis[k] > 1e-9:
+            axis = A[:, k] / axis[k]
+        return axis / (np.linalg.norm(axis) or 1.0) * angle
+    w = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    return w * (angle / (2.0 * np.sin(angle)))
+
+
+def quat_from_matrix(R: np.ndarray) -> list[float]:
+    """Rotation matrix -> [w, x, y, z]. Compact and interpolation-friendly for storage."""
+    t = np.trace(R)
+    if t > 0:
+        s = np.sqrt(t + 1.0) * 2
+        q = [0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s]
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        q = [(R[2, 1] - R[1, 2]) / s, 0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s]
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        q = [(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s]
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        q = [(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s]
+    q = np.array(q, dtype=float)
+    q /= np.linalg.norm(q) or 1.0
+    return [float(v) for v in q]
+
+
+def matrix_from_quat(q) -> np.ndarray:
+    """[w, x, y, z] -> rotation matrix."""
+    w, x, y, z = np.asarray(q, dtype=float) / (np.linalg.norm(q) or 1.0)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def pose_matrix(xyz, quat) -> np.ndarray:
+    T = np.eye(4)
+    T[:3, :3] = matrix_from_quat(quat)
+    T[:3, 3] = np.asarray(xyz, dtype=float)
+    return T
+
+
 @dataclass
 class Link:
     name: str
@@ -133,6 +193,97 @@ class SO101Kinematics:
                 T = T @ Rz
             frames.append((j["child"], T[:3, 3].copy()))
         return frames
+
+    def jacobian_pose(self, q_deg: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Numeric 6x5 Jacobian: rows 0-2 metres/rad, rows 3-5 rad/rad."""
+        J = np.zeros((6, len(ARM_JOINTS)))
+        T0 = self.fk(q_deg)
+        p0, R0 = T0[:3, 3], T0[:3, :3]
+        for i in range(len(ARM_JOINTS)):
+            dq = np.asarray(q_deg, dtype=float).copy()
+            dq[i] += np.degrees(eps)
+            T1 = self.fk(dq)
+            J[:3, i] = (T1[:3, 3] - p0) / eps
+            J[3:, i] = rot_log(T1[:3, :3] @ R0.T) / eps
+        return J
+
+    def ik_pose(
+        self,
+        target_T: np.ndarray,
+        q_init=None,
+        restarts: int = 12,
+        seed: int = 0,
+    ) -> tuple[np.ndarray, bool, float, float]:
+        """Pose IK with random restarts. Returns (q_deg, ok, pos_err_m, rot_err_rad).
+
+        Seeded from a nearby pose a single descent is enough, which is the normal
+        case during playback. A cold seed can settle into a local minimum, so on
+        failure we retry from random configurations and keep the best.
+        """
+        best = self._ik_pose_once(target_T, q_init)
+        if best[1]:
+            return best
+
+        lo = np.array([self.limits_deg[n][0] for n in ARM_JOINTS])
+        hi = np.array([self.limits_deg[n][1] for n in ARM_JOINTS])
+        rng = np.random.default_rng(seed)
+        for _ in range(restarts):
+            cand = self._ik_pose_once(target_T, rng.uniform(lo * 0.7, hi * 0.7))
+            # Rank on position first; orientation is the softer constraint.
+            if (cand[2], cand[3]) < (best[2], best[3]):
+                best = cand
+            if cand[1]:
+                break
+        return best
+
+    def _ik_pose_once(
+        self,
+        target_T: np.ndarray,
+        q_init=None,
+        max_iters: int = 300,
+        pos_tol: float = 1e-4,
+        rot_tol: float = 0.01,
+        damping: float = 0.02,
+        rot_weight: float = 0.06,
+    ) -> tuple[np.ndarray, bool, float, float]:
+        """Solve for position AND orientation. Returns (q_deg, ok, pos_err_m, rot_err_rad).
+
+        The arm has 5 joints, so a full 6-DOF pose is over-constrained in general
+        and an arbitrary hand-typed pose will not be reachable. Poses *captured
+        from the arm itself* always are, which is exactly how waypoints are made.
+
+        `rot_weight` scales the orientation rows so position still wins when the
+        two conflict -- being a centimetre off is worse than being a few degrees
+        off when the target is not perfectly attainable.
+        """
+        target_p = target_T[:3, 3]
+        target_R = target_T[:3, :3]
+        q = np.zeros(len(ARM_JOINTS)) if q_init is None else np.asarray(q_init, dtype=float).copy()
+
+        lo = np.array([self.limits_deg[n][0] for n in ARM_JOINTS])
+        hi = np.array([self.limits_deg[n][1] for n in ARM_JOINTS])
+        W = np.diag([1.0, 1.0, 1.0, rot_weight, rot_weight, rot_weight])
+
+        pos_err = rot_err = np.inf
+        for _ in range(max_iters):
+            T = self.fk(q)
+            e_p = target_p - T[:3, 3]
+            e_r = rot_log(target_R @ T[:3, :3].T)
+            pos_err, rot_err = float(np.linalg.norm(e_p)), float(np.linalg.norm(e_r))
+            if pos_err < pos_tol and rot_err < rot_tol:
+                return q, True, pos_err, rot_err
+
+            e = W @ np.concatenate([e_p, e_r])
+            J = W @ self.jacobian_pose(q)
+            JJt = J @ J.T + (damping ** 2) * np.eye(6)
+            dq = J.T @ np.linalg.solve(JJt, e)
+
+            step = np.linalg.norm(dq)
+            if step > 0.15:
+                dq *= 0.15 / step
+            q = np.clip(q + np.degrees(dq), lo, hi)
+
+        return q, False, pos_err, rot_err
 
     def gripper_geometry(self, q_deg, gripper_norm: float) -> dict[str, list[np.ndarray]]:
         """Segments for drawing both jaws, given the 0-100 gripper value.

@@ -22,6 +22,18 @@ DEFAULT_ID = "arm0"
 # per-motor mapping, so give the jaw plenty of room and keep the arm restrained.
 GRIPPER_MAX_STEP = 100.0
 
+# Servo tuning, measured on this arm (see README "Jitter").
+#
+# lerobot writes Acceleration = Maximum_Acceleration = 254, i.e. no smoothing at
+# all, so each commanded goal is chased at full acceleration. Backing that off
+# measured ~25% smoother motion AND less lag (1.23 deg -> 0.75 deg), because the
+# servo tracks the ramp instead of snapping past it.
+#
+# D = 0 was marginally better than lerobot's 32. P is left at lerobot's 16;
+# raising it to 32 measurably worsened both roughness and at-rest hold.
+SERVO_ACCELERATION = 24
+SERVO_D_COEFFICIENT = 0
+
 
 def smoothstep(a: float) -> float:
     return a * a * (3.0 - 2.0 * a)
@@ -69,9 +81,30 @@ def connect(port: str = DEFAULT_PORT, robot_id: str = DEFAULT_ID, max_step: floa
         SO101FollowerConfig(port=port, id=robot_id, max_relative_target=expand_max_step(max_step))
     )
     robot.connect(calibrate=False)
+    tune_servos(robot)
     robot.send_action({f"{k}.pos": v for k, v in read_joints(robot).items()})
     time.sleep(0.1)
     return robot
+
+
+def tune_servos(robot, acceleration: int = SERVO_ACCELERATION,
+                d_coefficient: int = SERVO_D_COEFFICIENT) -> None:
+    """Re-tune for smoother motion, overriding what `configure()` just wrote.
+
+    Must run after connect: lerobot's own `configure()` sets acceleration to the
+    maximum every time, so this has to come afterwards to stick.
+    """
+    was_enabled = True
+    try:
+        robot.bus.disable_torque()
+        was_enabled = False
+        for motor in robot.bus.motors:
+            robot.bus.write("Acceleration", motor, acceleration, num_retry=5)
+            robot.bus.write("Maximum_Acceleration", motor, acceleration, num_retry=5)
+            robot.bus.write("D_Coefficient", motor, d_coefficient, num_retry=5)
+    finally:
+        if not was_enabled:
+            robot.bus.enable_torque()
 
 
 def read_joints(robot) -> dict[str, float]:

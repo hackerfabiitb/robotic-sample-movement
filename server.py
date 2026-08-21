@@ -33,15 +33,16 @@ from pathlib import Path
 import numpy as np
 
 import arm
-from kinematics import ARM_JOINTS, SO101Kinematics
+from kinematics import ARM_JOINTS, SO101Kinematics, pose_matrix, quat_from_matrix
 
 WEB_DIR = Path(__file__).parent / "web"
 WAYPOINT_FILE = Path(__file__).parent / "waypoints.json"
 
-# Motion tuning for playback.
-T_TRAVEL = 3.0
-T_GRIPPER = 1.0
-GRIP_SETTLE = 0.4
+# Motion tuning for playback. Halved from the original 3.0/1.0 for 2x speed;
+# measured roughness at 1.5s is the same as at 3.0s, so this costs no smoothness.
+T_TRAVEL = 1.5
+T_GRIPPER = 0.5
+GRIP_SETTLE = 0.3
 RAMP_RATE = 30.0
 MAX_STEP = 12.0
 
@@ -55,6 +56,9 @@ _state: dict = {
     # One open value and one close value for the whole sequence, not per point.
     "gripper_open": 90.0,
     "gripper_close": 5.0,
+    # Waypoints record orientation as well as position; this decides whether
+    # playback tries to reproduce it.
+    "match_orientation": True,
     "log": [],
     "running_index": None,
 }
@@ -77,7 +81,8 @@ def load_saved() -> dict:
     Points used to carry their own gripper value; that is now a pair of values
     for the whole sequence, so any per-point `gripper` key is dropped on load.
     """
-    out = {"waypoints": [], "retract": None, "gripper_open": 90.0, "gripper_close": 5.0}
+    out = {"waypoints": [], "retract": None, "gripper_open": 90.0, "gripper_close": 5.0,
+           "match_orientation": True}
     if not WAYPOINT_FILE.exists():
         return out
     try:
@@ -85,12 +90,13 @@ def load_saved() -> dict:
         if isinstance(data, list):  # oldest layout: a bare list of points
             data = {"waypoints": data}
         out["waypoints"] = [
-            {"name": w.get("name") or f"p{i + 1}", "xyz": w["xyz"]}
+            {"name": w.get("name") or f"p{i + 1}", "xyz": w["xyz"], "quat": w.get("quat")}
             for i, w in enumerate(data.get("waypoints", []))
         ]
         out["retract"] = data.get("retract")
         out["gripper_open"] = float(data.get("gripper_open", 90.0))
         out["gripper_close"] = float(data.get("gripper_close", 5.0))
+        out["match_orientation"] = bool(data.get("match_orientation", True))
     except Exception:
         pass
     return out
@@ -102,6 +108,7 @@ def persist() -> None:
             "retract": _state.get("retract"),
             "gripper_open": _state.get("gripper_open"),
             "gripper_close": _state.get("gripper_close"),
+            "match_orientation": _state.get("match_orientation"),
             "waypoints": list(_state["waypoints"]),
         }
     WAYPOINT_FILE.write_text(json.dumps(data, indent=2))
@@ -135,12 +142,14 @@ def publish(robot, kin: SO101Kinematics, mode: str, running_index=None) -> dict[
     q = arm.arm_vector(joints)
     frames = kin.fk_frames(q)
     jaws = kin.gripper_geometry(q, joints.get("gripper", 0.0))
+    quat = quat_from_matrix(kin.fk(q)[:3, :3])
 
     with _state_lock:
         _state.update(
             connected=True,
             joints={k: round(v, 3) for k, v in joints.items()},
             xyz=[round(float(v), 5) for v in frames[-1][1]],
+            quat=[round(v, 6) for v in quat],
             skeleton=[[round(float(c), 5) for c in p] for _, p in frames],
             jaw_fixed=[[round(float(c), 5) for c in p] for p in jaws["fixed"]],
             jaw_moving=[[round(float(c), 5) for c in p] for p in jaws["moving"]],
@@ -170,20 +179,36 @@ def ramp(robot, kin, target: dict[str, float], duration: float, index=None) -> N
     time.sleep(0.3)
 
 
-def goto_xyz(robot, kin: SO101Kinematics, xyz, duration: float, index=None) -> bool:
-    """Solve IK from where the arm is now and interpolate there. False if unreachable."""
-    joints = arm.read_joints(robot)
-    q, _, err = kin.ik(np.asarray(xyz, dtype=float), q_init=arm.arm_vector(joints))
-    if err > 0.005:
-        log(f"ABORT: unreachable from here (off by {err * 1000:.0f} mm)")
+def solve(kin: SO101Kinematics, xyz, quat, q_seed, match_orientation: bool):
+    """Pose IK when the waypoint carries an orientation, position-only otherwise.
+
+    Returns (q_deg, pos_err_m, rot_err_rad_or_None).
+    """
+    if quat is not None and match_orientation:
+        q, _, p_err, r_err = kin.ik_pose(pose_matrix(xyz, quat), q_init=q_seed)
+        return q, p_err, r_err
+    q, _, p_err = kin.ik(np.asarray(xyz, dtype=float), q_init=q_seed)
+    return q, p_err, None
+
+
+def goto_pose(robot, kin: SO101Kinematics, xyz, quat, duration: float,
+              match_orientation: bool, index=None) -> bool:
+    """Solve from where the arm is now and interpolate there. False if unreachable."""
+    q_seed = arm.arm_vector(arm.read_joints(robot))
+    q, p_err, r_err = solve(kin, xyz, quat, q_seed, match_orientation)
+    if p_err > 0.005:
+        log(f"ABORT: unreachable from here (off by {p_err * 1000:.0f} mm)")
         return False
+    if r_err is not None and np.degrees(r_err) > 5.0:
+        log(f"    note: orientation off by {np.degrees(r_err):.1f} deg (5 joints "
+            "cannot always hit a full pose)")
     ramp(robot, kin, dict(zip(ARM_JOINTS, q)), duration, index)
     return True
 
 
 def run_sequence(robot, kin: SO101Kinematics, waypoints: list[dict],
                  retract: list[float] | None, grip_open: float, grip_close: float,
-                 cycles: int) -> None:
+                 cycles: int, match_orientation: bool = True) -> None:
     """Visit each point twice -- once to open, once to close -- retracting between.
 
     Per point:  move to p, open, retract, move to p, close, retract.
@@ -201,12 +226,16 @@ def run_sequence(robot, kin: SO101Kinematics, waypoints: list[dict],
         return
 
     # Check everything is solvable before making the arm stiff.
-    for label, xyz in [("retract", retract)] + [
-            (w.get("name") or f"point {i + 1}", w["xyz"]) for i, w in enumerate(waypoints)]:
-        _, _, err = kin.ik(np.array(xyz), q_init=np.zeros(5))
-        if err > 0.005:
-            log(f"ABORT: {label} is unreachable (off by {err * 1000:.0f} mm)")
+    checks = [("retract", retract, None)] + [
+        (w.get("name") or f"point {i + 1}", w["xyz"], w.get("quat"))
+        for i, w in enumerate(waypoints)]
+    for label, xyz, quat in checks:
+        _, p_err, r_err = solve(kin, xyz, quat, np.zeros(5), match_orientation)
+        if p_err > 0.005:
+            log(f"ABORT: {label} is unreachable (off by {p_err * 1000:.0f} mm)")
             return
+        if r_err is not None and np.degrees(r_err) > 5.0:
+            log(f"note: {label} orientation only reachable to {np.degrees(r_err):.1f} deg")
 
     log(f"torque ON -- {len(waypoints)} points x{cycles}, "
         f"open={grip_open:.0f} close={grip_close:.0f}")
@@ -216,13 +245,13 @@ def run_sequence(robot, kin: SO101Kinematics, waypoints: list[dict],
     robot.send_action({f"{k}.pos": v for k, v in arm.read_joints(robot).items()})
     time.sleep(0.1)
 
-    def leg(label: str, xyz, grip: float, grip_label: str, index: int) -> bool:
+    def leg(label: str, xyz, quat, grip: float, grip_label: str, index: int) -> bool:
         """move to the point -> actuate the gripper -> retract."""
         if _abort.is_set():
             log("aborted")
             return False
         log(f"  -> {label}")
-        if not goto_xyz(robot, kin, xyz, T_TRAVEL, index):
+        if not goto_pose(robot, kin, xyz, quat, T_TRAVEL, match_orientation, index):
             return False
 
         log(f"     {grip_label} ({grip:.0f})")
@@ -233,20 +262,23 @@ def run_sequence(robot, kin: SO101Kinematics, waypoints: list[dict],
             log("aborted")
             return False
         log("     -> retract")
-        return goto_xyz(robot, kin, retract, T_TRAVEL, index)
+        # The retract point has no recorded orientation -- it is just somewhere
+        # clear to wait, so let IK pick whatever wrist pose suits.
+        return goto_pose(robot, kin, retract, None, T_TRAVEL, match_orientation, index)
 
     try:
         log("-> retract (start)")
-        if not goto_xyz(robot, kin, retract, T_TRAVEL):
+        if not goto_pose(robot, kin, retract, None, T_TRAVEL, match_orientation):
             return
 
         for c in range(1, cycles + 1):
             for i, wp in enumerate(waypoints):
                 label = wp.get("name") or f"point {i + 1}"
                 log(f"cycle {c}/{cycles}: {label}")
-                if not leg(label, wp["xyz"], grip_open, "open", i):
+                quat = wp.get("quat")
+                if not leg(label, wp["xyz"], quat, grip_open, "open", i):
                     return
-                if not leg(label, wp["xyz"], grip_close, "close", i):
+                if not leg(label, wp["xyz"], quat, grip_close, "close", i):
                     return
         log("sequence complete")
     finally:
@@ -321,17 +353,20 @@ def handle_command(cmd: dict, robot, kin: SO101Kinematics) -> None:
 
     if action == "capture":
         joints = arm.read_joints(robot)
-        xyz = kin.fk_position(arm.arm_vector(joints))
+        T = kin.fk(arm.arm_vector(joints))
         with _state_lock:
             wps = list(_state["waypoints"])
         wps.append({
             "name": cmd.get("name") or f"p{len(wps) + 1}",
-            "xyz": [round(float(v), 5) for v in xyz],
+            "xyz": [round(float(v), 5) for v in T[:3, 3]],
+            # Captured straight off the arm, so the full 6-DOF pose is by
+            # construction reachable -- which a hand-typed one would not be.
+            "quat": [round(v, 6) for v in quat_from_matrix(T[:3, :3])],
         })
         with _state_lock:
             _state["waypoints"] = wps
         persist()
-        log(f"captured {wps[-1]['name']} at {np.round(xyz, 4).tolist()}")
+        log(f"captured {wps[-1]['name']} at {np.round(T[:3, 3], 4).tolist()} with orientation")
 
     elif action == "set_retract":
         joints = arm.read_joints(robot)
@@ -372,6 +407,13 @@ def handle_command(cmd: dict, robot, kin: SO101Kinematics) -> None:
         persist()
         log(f"{key.replace('_', ' ')} set to {value:.0f}")
 
+    elif action == "set_match_orientation":
+        with _state_lock:
+            _state["match_orientation"] = bool(cmd.get("value", True))
+            v = _state["match_orientation"]
+        persist()
+        log(f"match orientation: {'on' if v else 'off'}")
+
     elif action == "grip_preview":
         # Drive the jaw to one of the two values so you can eyeball it against a
         # real object. Only the gripper moves; the arm stays limp.
@@ -393,8 +435,10 @@ def handle_command(cmd: dict, robot, kin: SO101Kinematics) -> None:
             retract = _state.get("retract")
             g_open = float(_state["gripper_open"])
             g_close = float(_state["gripper_close"])
+            match_o = bool(_state.get("match_orientation", True))
         try:
-            run_sequence(robot, kin, wps, retract, g_open, g_close, int(cmd.get("cycles", 1)))
+            run_sequence(robot, kin, wps, retract, g_open, g_close,
+                         int(cmd.get("cycles", 1)), match_o)
         except Exception as e:
             log(f"run failed: {type(e).__name__}: {e}")
             try:

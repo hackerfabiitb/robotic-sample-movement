@@ -36,7 +36,7 @@ def main() -> int:
     p.add_argument("--xyz", nargs=3, type=float, metavar=("X", "Y", "Z"), help="target tool position, metres")
     p.add_argument("--gripper", help="open | close | half | a number 0-100")
     p.add_argument("--show", action="store_true", help="report current joints and tool position, then exit")
-    p.add_argument("--duration", type=float, default=4.0)
+    p.add_argument("--duration", type=float, default=2.0)
     p.add_argument("--max-step", type=float, default=12.0)
     p.add_argument("--allow-low", action="store_true", help=f"permit targets below z={Z_FLOOR}m")
     p.add_argument("--wait", type=float, default=0.0, help="seconds to wait for the servos to appear")

@@ -79,6 +79,9 @@
     <tr><td class="k">Y</td><td class="v" id="y">-</td></tr>
     <tr><td class="k">Z</td><td class="v" id="z">-</td></tr>
   </table>
+  <table>
+    <tr><td class="k">orientation</td><td class="v" id="rpy" style="font-size:12px">-</td></tr>
+  </table>
 
   <h2>Waypoints</h2>
   <div class="row">
@@ -116,6 +119,12 @@
     <input id="cycles" type="number" value="1" min="1" max="99"
            style="background:#0d1016;color:var(--fg);border:1px solid var(--line);
                   border-radius:4px;padding:4px 6px;font:inherit;text-align:right">
+  </div>
+  <div class="row" style="align-items:center">
+    <label class="k" style="flex:1; display:flex; gap:7px; align-items:center; cursor:pointer">
+      <input id="matchOri" type="checkbox" checked style="flex:none; cursor:pointer">
+      match captured orientation
+    </label>
   </div>
   <div class="row">
     <button id="run" class="primary">run (torque ON)</button>
@@ -169,6 +178,8 @@ document.getElementById('run').onclick = () => {
   }
 };
 document.getElementById('abort').onclick = () => post({ action: 'abort' });
+document.getElementById('matchOri').onchange = (e) =>
+  post({ action: 'set_match_orientation', value: e.target.checked });
 document.getElementById('gOpen').onchange = (e) =>
   post({ action: 'set_gripper_open', value: parseFloat(e.target.value) });
 document.getElementById('gClose').onchange = (e) =>
@@ -271,6 +282,7 @@ scene.add(retractMarker);
 
 // Waypoint markers.
 let markers = [];
+let triads = [];
 function renderMarkers(wps, activeIndex) {
   while (markers.length > wps.length) scene.remove(markers.pop());
   while (markers.length < wps.length) {
@@ -282,6 +294,25 @@ function renderMarkers(wps, activeIndex) {
   wps.forEach((w, i) => {
     markers[i].position.set(w.xyz[0], w.xyz[1], w.xyz[2]);
     markers[i].scale.setScalar(i === activeIndex ? 1.7 : 1);
+  });
+
+  // One axis triad per waypoint, so a recorded orientation is visible rather
+  // than just implied by a dot.
+  while (triads.length > wps.length) scene.remove(triads.pop());
+  while (triads.length < wps.length) {
+    const t = new THREE.AxesHelper(0.035);
+    scene.add(t);
+    triads.push(t);
+  }
+  wps.forEach((w, i) => {
+    triads[i].position.set(w.xyz[0], w.xyz[1], w.xyz[2]);
+    if (w.quat) {
+      const [qw, qx, qy, qz] = w.quat;
+      triads[i].quaternion.set(qx, qy, qz, qw);  // three.js order is x,y,z,w
+      triads[i].visible = true;
+    } else {
+      triads[i].visible = false;
+    }
   });
 }
 
@@ -383,6 +414,22 @@ function update(s) {
   document.getElementById('x').textContent = s.xyz[0].toFixed(4);
   document.getElementById('y').textContent = s.xyz[1].toFixed(4);
   document.getElementById('z').textContent = s.xyz[2].toFixed(4);
+
+  if (s.quat) {
+    // Quaternion is what gets stored; roll/pitch/yaw is only for reading.
+    const [w, x, y, z] = s.quat;
+    const roll = Math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y));
+    const pitch = Math.asin(Math.max(-1, Math.min(1, 2 * (w * y - z * x))));
+    const yaw = Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
+    const d = r => (r * 180 / Math.PI).toFixed(1).padStart(6);
+    document.getElementById('rpy').textContent =
+      'r' + d(roll) + '  p' + d(pitch) + '  y' + d(yaw);
+  }
+
+  const mo = document.getElementById('matchOri');
+  if (document.activeElement !== mo && s.match_orientation !== undefined) {
+    mo.checked = s.match_orientation;
+  }
 
   for (const name of ORDER) {
     const v = s.joints[name];

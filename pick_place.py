@@ -58,12 +58,13 @@ GRIPPER_CLOSED = 5.0
 CYCLES = 1
 
 # Seconds for each motion. Travel moves are longer since they cover more ground.
-T_TRAVEL = 3.0
-T_DESCEND = 1.5
-T_GRIPPER = 1.0
+# Halved for 2x speed; measured roughness at 1.5s matches 3.0s, so nothing is lost.
+T_TRAVEL = 1.5
+T_DESCEND = 0.75
+T_GRIPPER = 0.5
 
 # Pause after the jaw moves, so it has actually gripped before the arm lifts.
-GRIP_SETTLE = 0.5
+GRIP_SETTLE = 0.3
 
 # Cap on how far a goal may lead the measured position, in degrees.
 MAX_STEP = 12.0

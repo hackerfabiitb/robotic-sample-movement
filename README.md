@@ -308,7 +308,7 @@ The GUI holds three things: a **list of points**, a **pair of gripper values**
 (one open, one close, for the whole sequence), and a **retract position**.
 
 1. Move the gripper by hand to where you want a point.
-2. **+ capture here** records the tool XYZ. Points carry position only.
+2. **+ capture here** records the tool XYZ **and its orientation**.
 3. Repeat for every point, deleting any you don't want.
 4. Set the **open** and **close** gripper values. **try** drives just the jaw so
    you can check a value against a real object, leaving the arm limp.
@@ -344,6 +344,28 @@ start without one** rather than silently running a different shape. Every point
 *and* the retract are IK-checked before torque is enabled, so an unreachable
 target aborts while the arm is still limp.
 
+### Orientation
+
+Capture records the full 6-DOF pose, stored as a quaternion, and playback
+reproduces it. The **match captured orientation** checkbox turns this off and
+falls back to position-only.
+
+The arm has 5 joints, so an arbitrary 6-DOF pose is over-constrained and in
+general unreachable. Poses *captured from the arm itself* always are, which is
+exactly how waypoints are made -- so this works in practice while a hand-typed
+orientation might not. Solving 300 captured-style poses: **300/300 converged,
+max 0.10 mm and 0.52 deg**; a real pose captured off the arm reproduced to
+0.050 mm and 0.069 deg.
+
+Where a pose cannot be hit exactly, position wins -- orientation rows are
+weighted down in the solver, and playback logs how many degrees it gave up.
+
+The retract point deliberately has **no** orientation: it is just somewhere clear
+to wait, so IK is free to pick whatever wrist pose suits.
+
+Each waypoint draws a small axis triad in the 3D view, so a recorded orientation
+is visible rather than merely implied by a dot.
+
 State persists to `waypoints.json`:
 
 ```json
@@ -351,7 +373,10 @@ State persists to `waypoints.json`:
   "retract": [0.25, 0.0, 0.22],
   "gripper_open": 85.0,
   "gripper_close": 12.0,
-  "waypoints": [{"name": "p1", "xyz": [0.22, -0.1, 0.1]}]
+  "match_orientation": true,
+  "waypoints": [
+    {"name": "p1", "xyz": [0.22, -0.1, 0.1], "quat": [0.49, 0.21, 0.84, -0.1]}
+  ]
 }
 ```
 
@@ -407,6 +432,69 @@ has plenty of headroom. `--rate` raises it.
 ```powershell
 python server.py --http-port 8080 --rate 60 --no-browser
 ```
+
+## Jitter
+
+The arm is visibly rough during motion. Measured, rather than guessed at, by
+sweeping one joint and taking the RMS of the high-frequency part of its velocity
+on a fixed 100 Hz analysis grid (resampling first, so encoder quantisation at
+short intervals cannot masquerade as roughness).
+
+**Raising the command rate does not help.** This was the obvious hypothesis --
+30 Hz goals to a position-mode servo ought to stair-step -- and it is wrong:
+
+| Command rate | Goal step | Roughness (deg/s) |
+| --- | --- | --- |
+| 30 Hz | 0.67 deg | 2.2 |
+| 60 Hz | 0.33 deg | 2.5 |
+| 120 Hz | 0.17 deg | 2.4 |
+| 200 Hz | 0.10 deg | 3.0 |
+
+Flat, and slightly worse at the top. So going to 650 Hz would gain nothing. For
+reference the bus could take it -- 569 Hz for commands, 307 Hz for a full
+read-and-command loop -- the rate simply is not the bottleneck.
+
+**At rest the arm is rock steady**: position noise measured 0.000 deg holding a
+fixed goal. The servo is not hunting, so this is not a control-loop oscillation.
+
+**Servo acceleration is the one real software lever.** lerobot writes
+`Acceleration = Maximum_Acceleration = 254`, the maximum, so every goal is chased
+flat out ([feetech.py:209-217](.venv/Lib/site-packages/lerobot/motors/feetech/feetech.py#L209-L217)):
+
+| Acceleration | Roughness (deg/s) | Lag (deg) |
+| --- | --- | --- |
+| 254 (lerobot default) | 3.2 | 1.23 |
+| 96 | 2.6 | 1.05 |
+| 24 | 2.4 | 0.88 |
+| 12 | 2.2 | 0.75 |
+
+Backing it off is ~25% smoother *and* tracks better, because the servo follows
+the ramp instead of overshooting each goal.
+
+Gains barely matter: P = 16 (lerobot's value) beat 32 on both roughness and hold;
+D = 0 was marginally better than lerobot's 32.
+
+[arm.py](arm.py) now applies `Acceleration = 24`, `D = 0` on connect, in
+`tune_servos()`. It has to run *after* `robot.connect()`, since lerobot's own
+`configure()` resets acceleration to maximum every time.
+
+**What is left is mechanical, and your instinct about backlash is right.** Rate
+does nothing, gains do nothing, it holds perfectly still at rest, and the best
+tuning still leaves ~2.2 deg/s. That signature -- rough only while moving, silent
+when stopped -- is stick-slip and lash in the 1/345 plastic gearboxes, which no
+amount of software will remove. Software can only stop making it worse.
+
+One thing that genuinely helps in practice: **approach every point from the same
+direction**. Backlash is hysteresis, so consistent approach makes the error
+repeatable even though it does not make it smaller. The retract-then-approach
+playback shape already does this.
+
+## Speed
+
+Motion is 2x faster: `T_TRAVEL` 3.0s -> 1.5s and `T_GRIPPER` 1.0s -> 0.5s, in
+both [server.py](server.py) and [pick_place.py](pick_place.py); `move_ee.py`
+defaults to `--duration 2.0`. Measured roughness at 1.5s is the same as at 3.0s
+(2.3 vs 2.4 deg/s), so the speed costs no smoothness.
 
 ## Troubleshooting
 
