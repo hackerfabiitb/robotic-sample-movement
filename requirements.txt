@@ -1,0 +1,16 @@
+# SO-101 robot arm control environment.
+#
+# Direct dependency only -- pip resolves the rest (torch, numpy, pyserial, ...).
+# Install into a Python 3.12 environment; see README.md.
+#
+#   lerobot extras used here:
+#     feetech       -> feetech-servo-sdk, the STS3215 servo protocol
+#     core_scripts  -> dataset + hardware + viz, which provides the
+#                      lerobot-find-port / setup-motors / calibrate /
+#                      teleoperate / record CLIs
+#
+# Verified working set on Windows 11 / Python 3.12.13:
+#   lerobot 0.6.1, feetech-servo-sdk 1.0.0, pyserial 3.5,
+#   torch 2.11.0, torchvision 0.26.0, torchcodec 0.11.1, numpy 2.2.6
+
+lerobot[feetech,core_scripts]==0.6.1
