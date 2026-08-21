@@ -52,6 +52,11 @@
                font: inherit; font-size: 11px; }
   #wps .del { flex: none; padding: 2px 7px; font-size: 12px; line-height: 1.2; }
   #empty { color: var(--dim); font-size: 11px; padding: 6px 0; }
+  .num { background: #0d1016; color: var(--fg); text-align: right;
+         border: 1px solid var(--line); border-radius: 4px; padding: 5px 7px; font: inherit; }
+  #gripHint { color: var(--dim); font-size: 11px; padding: 2px 0 0; }
+  #retractInfo { color: var(--dim); font-size: 11px; padding: 4px 0; }
+  #retractInfo.set { color: #93c5fd; }
   #log { background: #0d1016; border: 1px solid var(--line); border-radius: 5px;
          padding: 8px; height: 120px; overflow-y: auto; font-size: 11px;
          color: var(--dim); white-space: pre-wrap; }
@@ -81,8 +86,29 @@
     <button id="clear" class="danger" style="flex:0 0 70px">clear</button>
   </div>
   <ul id="wps"></ul>
-  <div id="empty">Back-drive the arm by hand, then capture. The number on the
-    right is the gripper value used at that point (0 shut, 100 open).</div>
+  <div id="empty">Back-drive the arm by hand, then capture. Each point is
+    visited twice &mdash; once to open, once to close.</div>
+
+  <h2>Gripper values</h2>
+  <div class="row">
+    <label class="k" style="flex:0 0 52px; align-self:center">open</label>
+    <input id="gOpen" class="num" type="number" min="0" max="100" step="1" value="90">
+    <button id="prevOpen" style="flex:0 0 62px">try</button>
+  </div>
+  <div class="row">
+    <label class="k" style="flex:0 0 52px; align-self:center">close</label>
+    <input id="gClose" class="num" type="number" min="0" max="100" step="1" value="5">
+    <button id="prevClose" style="flex:0 0 62px">try</button>
+  </div>
+  <div id="gripHint">0 shut, 100 open. "try" drives just the jaw so you can
+    check it against a real object; the arm stays limp.</div>
+
+  <h2>Retract position</h2>
+  <div class="row">
+    <button id="setRetract">set retract here</button>
+    <button id="clearRetract" class="danger" style="flex:0 0 70px">clear</button>
+  </div>
+  <div id="retractInfo">not set</div>
 
   <h2>Playback</h2>
   <div class="row">
@@ -143,6 +169,15 @@ document.getElementById('run').onclick = () => {
   }
 };
 document.getElementById('abort').onclick = () => post({ action: 'abort' });
+document.getElementById('gOpen').onchange = (e) =>
+  post({ action: 'set_gripper_open', value: parseFloat(e.target.value) });
+document.getElementById('gClose').onchange = (e) =>
+  post({ action: 'set_gripper_close', value: parseFloat(e.target.value) });
+document.getElementById('prevOpen').onclick = () => post({ action: 'grip_preview', which: 'open' });
+document.getElementById('prevClose').onclick = () => post({ action: 'grip_preview', which: 'close' });
+
+document.getElementById('setRetract').onclick = () => post({ action: 'set_retract' });
+document.getElementById('clearRetract').onclick = () => post({ action: 'clear_retract' });
 
 // Rebuild the waypoint list only when it actually changes -- otherwise a 30 Hz
 // stream would blow away whatever the user is typing in a gripper field.
@@ -160,11 +195,8 @@ function renderWaypoints(wps, activeIndex) {
       li.innerHTML =
         '<span class="nm">' + w.name + '</span>' +
         '<span class="co">' + xyz + '</span>' +
-        '<input type="number" min="0" max="100" step="1" value="' + w.gripper + '">' +
         '<button class="del">x</button>';
       li.querySelector('.del').onclick = () => post({ action: 'delete', index: i });
-      li.querySelector('input').onchange = (e) =>
-        post({ action: 'set_gripper', index: i, value: parseFloat(e.target.value) });
       wpsEl.appendChild(li);
     }
     document.getElementById('empty').style.display = wps.length ? 'none' : 'block';
@@ -228,6 +260,14 @@ const TRAIL = 150;
 const trailPts = [];
 const trailGeom = polyline(TRAIL, 0x2f6f66);
 trailGeom.setDrawRange(0, 0);
+
+// Retract marker -- a box, so it reads as different in kind from the round
+// waypoint markers rather than just a different colour.
+const retractMarker = new THREE.Mesh(
+  new THREE.BoxGeometry(0.018, 0.018, 0.018),
+  new THREE.MeshBasicMaterial({ color: 0x93c5fd, transparent: true, opacity: 0.8 }));
+retractMarker.visible = false;
+scene.add(retractMarker);
 
 // Waypoint markers.
 let markers = [];
@@ -299,9 +339,32 @@ function update(s) {
   statusText.textContent = running ? 'RUNNING - torque ON'
     : (s.connected ? 'monitor - torque off, back-drivable' : 'connecting...');
   banner.classList.toggle('on', running);
-  document.getElementById('run').disabled = running || !(s.waypoints || []).length;
+  const hasRetract = Array.isArray(s.retract);
+  document.getElementById('run').disabled =
+    running || !(s.waypoints || []).length || !hasRetract;
   document.getElementById('abort').disabled = !running;
   document.getElementById('capture').disabled = running;
+  document.getElementById('setRetract').disabled = running;
+  document.getElementById('prevOpen').disabled = running;
+  document.getElementById('prevClose').disabled = running;
+
+  for (const [id, key] of [['gOpen', 'gripper_open'], ['gClose', 'gripper_close']]) {
+    const el = document.getElementById(id);
+    if (document.activeElement !== el && s[key] !== undefined) el.value = s[key];
+  }
+
+  const rInfo = document.getElementById('retractInfo');
+  if (hasRetract) {
+    rInfo.textContent = 'retract  ' + s.retract.map(v => v.toFixed(3)).join('  ');
+    rInfo.className = 'set';
+    retractMarker.position.set(s.retract[0], s.retract[1], s.retract[2]);
+    retractMarker.visible = true;
+  } else {
+    rInfo.textContent = 'not set - required before running. Back-drive the arm ' +
+      'somewhere clear of the workpiece and press the button above.';
+    rInfo.className = '';
+    retractMarker.visible = false;
+  }
 
   if (s.log && s.log.length) {
     const joined = s.log.join('\n');

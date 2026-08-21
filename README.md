@@ -304,19 +304,65 @@ It always returns to monitor with torque off when a run ends, aborts, or fails.
 
 ### Recording and playing a sequence
 
+The GUI holds three things: a **list of points**, a **pair of gripper values**
+(one open, one close, for the whole sequence), and a **retract position**.
+
 1. Move the gripper by hand to where you want a point.
-2. **+ capture here** records the tool XYZ *and the current gripper value*.
-3. Repeat. Edit any waypoint's gripper number in the list, or delete it.
-4. Set **cycles**, then **run (torque ON)**. **stop** aborts mid-motion.
+2. **+ capture here** records the tool XYZ. Points carry position only.
+3. Repeat for every point, deleting any you don't want.
+4. Set the **open** and **close** gripper values. **try** drives just the jaw so
+   you can check a value against a real object, leaving the arm limp.
+5. Back-drive the arm somewhere clear and press **set retract here**.
+6. Set **cycles**, then **run (torque ON)**. **stop** aborts mid-motion.
 
-Playback visits each waypoint in order, then sets the gripper to that waypoint's
-value. So "open at p1, close at p1, move to p2, open" is just four captures of
-the same two places with different gripper numbers -- no special pick/place mode.
+Each point is visited **twice** -- once to open, once to close -- retracting
+after each:
 
-Waypoints persist to `waypoints.json`, so they survive a restart.
+```
+-> retract (start)
+cycle 1/1: p1
+  -> p1
+     open (85)
+     -> retract
+  -> p1
+     close (12)
+     -> retract
+cycle 1/1: p2
+  -> p2
+     open (85)
+     -> retract
+  -> p2
+     close (12)
+     -> retract
+```
 
-Every waypoint is IK-checked **before** torque is enabled, so an unreachable
-point aborts while the arm is still limp.
+**Retract moves never touch the gripper.** After closing on an object the arm
+has to lift away still holding it, so retracting only repositions the arm.
+
+The retract point is set separately from the list, and **playback refuses to
+start without one** rather than silently running a different shape. Every point
+*and* the retract are IK-checked before torque is enabled, so an unreachable
+target aborts while the arm is still limp.
+
+State persists to `waypoints.json`:
+
+```json
+{
+  "retract": [0.25, 0.0, 0.22],
+  "gripper_open": 85.0,
+  "gripper_close": 12.0,
+  "waypoints": [{"name": "p1", "xyz": [0.22, -0.1, 0.1]}]
+}
+```
+
+Both older layouts still load: a bare list of points, and the version where each
+point carried its own `gripper` value (that key is dropped, since the open/close
+pair now covers it).
+
+> [!NOTE]
+> A run ends by disabling torque so you can back-drive again. The arm is at the
+> retract point when that happens, so it will **drop** from there. Put the
+> retract somewhere a fall is harmless, or catch it.
 
 ### Gripper rendering
 

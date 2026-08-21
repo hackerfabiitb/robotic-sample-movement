@@ -51,6 +51,10 @@ _state: dict = {
     "mode": "starting",
     "seq": 0,
     "waypoints": [],
+    "retract": None,
+    # One open value and one close value for the whole sequence, not per point.
+    "gripper_open": 90.0,
+    "gripper_close": 5.0,
     "log": [],
     "running_index": None,
 }
@@ -67,17 +71,40 @@ def log(msg: str) -> None:
     print(msg)
 
 
-def load_waypoints() -> list[dict]:
-    if WAYPOINT_FILE.exists():
-        try:
-            return json.loads(WAYPOINT_FILE.read_text())
-        except Exception:
-            pass
-    return []
+def load_saved() -> dict:
+    """Read the saved setup, tolerating both older file layouts.
+
+    Points used to carry their own gripper value; that is now a pair of values
+    for the whole sequence, so any per-point `gripper` key is dropped on load.
+    """
+    out = {"waypoints": [], "retract": None, "gripper_open": 90.0, "gripper_close": 5.0}
+    if not WAYPOINT_FILE.exists():
+        return out
+    try:
+        data = json.loads(WAYPOINT_FILE.read_text())
+        if isinstance(data, list):  # oldest layout: a bare list of points
+            data = {"waypoints": data}
+        out["waypoints"] = [
+            {"name": w.get("name") or f"p{i + 1}", "xyz": w["xyz"]}
+            for i, w in enumerate(data.get("waypoints", []))
+        ]
+        out["retract"] = data.get("retract")
+        out["gripper_open"] = float(data.get("gripper_open", 90.0))
+        out["gripper_close"] = float(data.get("gripper_close", 5.0))
+    except Exception:
+        pass
+    return out
 
 
-def save_waypoints(wps: list[dict]) -> None:
-    WAYPOINT_FILE.write_text(json.dumps(wps, indent=2))
+def persist() -> None:
+    with _state_lock:
+        data = {
+            "retract": _state.get("retract"),
+            "gripper_open": _state.get("gripper_open"),
+            "gripper_close": _state.get("gripper_close"),
+            "waypoints": list(_state["waypoints"]),
+        }
+    WAYPOINT_FILE.write_text(json.dumps(data, indent=2))
 
 
 def port_busy_hint(port: str, e: Exception) -> str:
@@ -143,45 +170,84 @@ def ramp(robot, kin, target: dict[str, float], duration: float, index=None) -> N
     time.sleep(0.3)
 
 
-def run_sequence(robot, kin: SO101Kinematics, waypoints: list[dict], cycles: int) -> None:
-    """Play the recorded waypoints back with torque on."""
+def goto_xyz(robot, kin: SO101Kinematics, xyz, duration: float, index=None) -> bool:
+    """Solve IK from where the arm is now and interpolate there. False if unreachable."""
+    joints = arm.read_joints(robot)
+    q, _, err = kin.ik(np.asarray(xyz, dtype=float), q_init=arm.arm_vector(joints))
+    if err > 0.005:
+        log(f"ABORT: unreachable from here (off by {err * 1000:.0f} mm)")
+        return False
+    ramp(robot, kin, dict(zip(ARM_JOINTS, q)), duration, index)
+    return True
+
+
+def run_sequence(robot, kin: SO101Kinematics, waypoints: list[dict],
+                 retract: list[float] | None, grip_open: float, grip_close: float,
+                 cycles: int) -> None:
+    """Visit each point twice -- once to open, once to close -- retracting between.
+
+    Per point:  move to p, open, retract, move to p, close, retract.
+
+    The gripper values are one open and one close for the whole sequence, so the
+    points list carries positions only. Retract moves never touch the gripper:
+    after closing on an object the arm has to lift away still holding it.
+    """
     if not waypoints:
-        log("nothing to run -- capture some waypoints first")
+        log("nothing to run -- capture some points first")
+        return
+    if retract is None:
+        log("ABORT: no retract position set. Back-drive the arm somewhere clear "
+            "and press 'set retract here' first.")
         return
 
-    # Check every target is solvable before making the arm stiff.
-    for i, wp in enumerate(waypoints):
-        _, _, err = kin.ik(np.array(wp["xyz"]), q_init=np.zeros(5))
+    # Check everything is solvable before making the arm stiff.
+    for label, xyz in [("retract", retract)] + [
+            (w.get("name") or f"point {i + 1}", w["xyz"]) for i, w in enumerate(waypoints)]:
+        _, _, err = kin.ik(np.array(xyz), q_init=np.zeros(5))
         if err > 0.005:
-            log(f"ABORT: waypoint {i + 1} is unreachable (off by {err * 1000:.0f} mm)")
+            log(f"ABORT: {label} is unreachable (off by {err * 1000:.0f} mm)")
             return
 
-    log(f"torque ON -- running {len(waypoints)} waypoints x{cycles}")
+    log(f"torque ON -- {len(waypoints)} points x{cycles}, "
+        f"open={grip_open:.0f} close={grip_close:.0f}")
     robot.bus.enable_torque()
     # Assert the present pose before anything else, so enabling torque cannot
     # snap the arm toward a stale goal left in the servos.
     robot.send_action({f"{k}.pos": v for k, v in arm.read_joints(robot).items()})
     time.sleep(0.1)
 
+    def leg(label: str, xyz, grip: float, grip_label: str, index: int) -> bool:
+        """move to the point -> actuate the gripper -> retract."""
+        if _abort.is_set():
+            log("aborted")
+            return False
+        log(f"  -> {label}")
+        if not goto_xyz(robot, kin, xyz, T_TRAVEL, index):
+            return False
+
+        log(f"     {grip_label} ({grip:.0f})")
+        ramp(robot, kin, {"gripper": float(grip)}, T_GRIPPER, index)
+        time.sleep(GRIP_SETTLE)
+
+        if _abort.is_set():
+            log("aborted")
+            return False
+        log("     -> retract")
+        return goto_xyz(robot, kin, retract, T_TRAVEL, index)
+
     try:
+        log("-> retract (start)")
+        if not goto_xyz(robot, kin, retract, T_TRAVEL):
+            return
+
         for c in range(1, cycles + 1):
             for i, wp in enumerate(waypoints):
-                if _abort.is_set():
-                    log("aborted")
+                label = wp.get("name") or f"point {i + 1}"
+                log(f"cycle {c}/{cycles}: {label}")
+                if not leg(label, wp["xyz"], grip_open, "open", i):
                     return
-                joints = arm.read_joints(robot)
-                q, _, err = kin.ik(np.array(wp["xyz"]), q_init=arm.arm_vector(joints))
-                if err > 0.005:
-                    log(f"ABORT: waypoint {i + 1} unreachable from here")
+                if not leg(label, wp["xyz"], grip_close, "close", i):
                     return
-                label = wp.get("name") or f"waypoint {i + 1}"
-                log(f"cycle {c}/{cycles}: -> {label}")
-                ramp(robot, kin, dict(zip(ARM_JOINTS, q)), T_TRAVEL, i)
-
-                if wp.get("gripper") is not None:
-                    log(f"    gripper -> {wp['gripper']:.0f}")
-                    ramp(robot, kin, {"gripper": float(wp["gripper"])}, T_GRIPPER, i)
-                    time.sleep(GRIP_SETTLE)
         log("sequence complete")
     finally:
         robot.bus.disable_torque()
@@ -215,8 +281,9 @@ def poll_arm(port: str, robot_id: str, rate: float) -> None:
             raise RuntimeError(port_busy_hint(port, e)) from e
 
         robot.bus.disable_torque()
+        saved = load_saved()
         with _state_lock:
-            _state["waypoints"] = load_waypoints()
+            _state.update(saved)
             _state["error"] = None
         log("connected -- torque OFF, arm is back-drivable")
 
@@ -260,12 +327,25 @@ def handle_command(cmd: dict, robot, kin: SO101Kinematics) -> None:
         wps.append({
             "name": cmd.get("name") or f"p{len(wps) + 1}",
             "xyz": [round(float(v), 5) for v in xyz],
-            "gripper": round(float(joints.get("gripper", 0.0)), 1),
         })
-        save_waypoints(wps)
         with _state_lock:
             _state["waypoints"] = wps
-        log(f"captured {wps[-1]['name']} at {np.round(xyz, 4).tolist()} grip {wps[-1]['gripper']:.0f}")
+        persist()
+        log(f"captured {wps[-1]['name']} at {np.round(xyz, 4).tolist()}")
+
+    elif action == "set_retract":
+        joints = arm.read_joints(robot)
+        xyz = [round(float(v), 5) for v in kin.fk_position(arm.arm_vector(joints))]
+        with _state_lock:
+            _state["retract"] = xyz
+        persist()
+        log(f"retract position set to {xyz}")
+
+    elif action == "clear_retract":
+        with _state_lock:
+            _state["retract"] = None
+        persist()
+        log("retract position cleared")
 
     elif action == "delete":
         i = int(cmd.get("index", -1))
@@ -273,34 +353,48 @@ def handle_command(cmd: dict, robot, kin: SO101Kinematics) -> None:
             wps = list(_state["waypoints"])
         if 0 <= i < len(wps):
             removed = wps.pop(i)
-            save_waypoints(wps)
             with _state_lock:
                 _state["waypoints"] = wps
+            persist()
             log(f"deleted {removed['name']}")
 
     elif action == "clear":
-        save_waypoints([])
         with _state_lock:
             _state["waypoints"] = []
+        persist()
         log("cleared all waypoints")
 
-    elif action == "set_gripper":
+    elif action in ("set_gripper_open", "set_gripper_close"):
+        key = "gripper_open" if action.endswith("open") else "gripper_close"
+        value = float(np.clip(float(cmd.get("value", 50.0)), 0.0, 100.0))
         with _state_lock:
-            wps = list(_state["waypoints"])
-        i = int(cmd.get("index", -1))
-        if 0 <= i < len(wps):
-            wps[i]["gripper"] = float(cmd.get("value", 50.0))
-            save_waypoints(wps)
-            with _state_lock:
-                _state["waypoints"] = wps
-            log(f"{wps[i]['name']} gripper set to {wps[i]['gripper']:.0f}")
+            _state[key] = value
+        persist()
+        log(f"{key.replace('_', ' ')} set to {value:.0f}")
+
+    elif action == "grip_preview":
+        # Drive the jaw to one of the two values so you can eyeball it against a
+        # real object. Only the gripper moves; the arm stays limp.
+        key = "gripper_open" if cmd.get("which") == "open" else "gripper_close"
+        with _state_lock:
+            value = float(_state[key])
+        log(f"previewing {key.replace('_', ' ')} ({value:.0f})")
+        robot.bus.enable_torque(["gripper"])
+        try:
+            ramp(robot, kin, {"gripper": value}, T_GRIPPER)
+            time.sleep(GRIP_SETTLE)
+        finally:
+            robot.bus.disable_torque(["gripper"])
 
     elif action == "run":
         _abort.clear()
         with _state_lock:
             wps = list(_state["waypoints"])
+            retract = _state.get("retract")
+            g_open = float(_state["gripper_open"])
+            g_close = float(_state["gripper_close"])
         try:
-            run_sequence(robot, kin, wps, int(cmd.get("cycles", 1)))
+            run_sequence(robot, kin, wps, retract, g_open, g_close, int(cmd.get("cycles", 1)))
         except Exception as e:
             log(f"run failed: {type(e).__name__}: {e}")
             try:
