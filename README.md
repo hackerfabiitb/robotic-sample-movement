@@ -554,6 +554,13 @@ hitting this repeatedly:
   are fatal.
 - **Connect retries.** Startup retries 3 times, 3s apart, which covers both a
   previous server still releasing the port and a bus glitch after a hard kill.
+- **A failed connect releases the port.** `robot.connect()` opens the serial
+  port before the writes that follow it, so a glitch during those writes used to
+  leave the handle open. The next attempt then collided with it and reported the
+  port as held by another process -- which it was: the previous attempt. Seen in
+  the wild as `attempt 1 failed (bus glitch)` followed by `attempt 2 failed (port
+  still held)`, a cascade entirely of its own making. `arm.connect()` now closes
+  the port on every failure path.
 
 The connect error message also distinguishes the two causes now, because they
 look identical but have opposite fixes -- kill a process, versus just wait. The

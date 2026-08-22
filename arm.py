@@ -80,11 +80,37 @@ def connect(port: str = DEFAULT_PORT, robot_id: str = DEFAULT_ID, max_step: floa
     robot = SO101Follower(
         SO101FollowerConfig(port=port, id=robot_id, max_relative_target=expand_max_step(max_step))
     )
-    robot.connect(calibrate=False)
-    tune_servos(robot)
-    robot.send_action({f"{k}.pos": v for k, v in read_joints(robot).items()})
-    time.sleep(0.1)
-    return robot
+    try:
+        robot.connect(calibrate=False)
+        tune_servos(robot)
+        robot.send_action({f"{k}.pos": v for k, v in read_joints(robot).items()})
+        time.sleep(0.1)
+        return robot
+    except Exception:
+        # robot.connect() opens the serial port before any of the writes that
+        # follow it. If one of those fails -- a dropped status packet is enough
+        # -- the port would otherwise stay open, and the next attempt to connect
+        # collides with this leaked handle and reports the port as "held by
+        # another process". Which it is: this one.
+        close_quietly(robot)
+        raise
+
+
+def close_quietly(robot) -> None:
+    """Release the serial port, swallowing anything that goes wrong doing so.
+
+    Used on failure paths, where the original exception is the interesting one
+    and a secondary error while cleaning up would only mask it.
+    """
+    try:
+        robot.disconnect()
+        return
+    except Exception:
+        pass
+    try:
+        robot.bus.port_handler.closePort()
+    except Exception:
+        pass
 
 
 def tune_servos(robot, acceleration: int = SERVO_ACCELERATION,
