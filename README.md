@@ -496,6 +496,72 @@ both [server.py](server.py) and [pick_place.py](pick_place.py); `move_ee.py`
 defaults to `--duration 2.0`. Measured roughness at 1.5s is the same as at 3.0s
 (2.3 vs 2.4 deg/s), so the speed costs no smoothness.
 
+## Teach by demonstration
+
+Show the arm a task by hand, then have it repeat it.
+
+1. Type a name, press **&#9679; record**. Torque is released.
+2. Move the arm through the whole task by hand, gripper included.
+3. Press **&#9632; stop**. The trajectory is saved under `recordings/`.
+4. Press **play** on it. Set **speed** (0.1-4x) and **cycles** first.
+
+This is separate from the waypoint system: waypoints are discrete poses you
+choose, a demonstration is a continuous trajectory you perform.
+
+### Recorded in joint space, deliberately
+
+What you physically showed the arm *is* a joint trajectory, so replaying those
+angles reproduces it exactly. Going via Cartesian would mean solving IK on every
+frame, which can pick a different elbow configuration, wander near a
+singularity, or fail outright on a pose the demo passed through happily.
+
+All six joints are captured, gripper included, at the poller's 30 Hz.
+
+Hand-guided motion is shaky, so [demos.py](demos.py) moving-averages each channel
+before replay (`SMOOTH_WINDOW = 7`, ~0.23s). The **raw** samples are what gets
+stored, so changing the window re-reads cleanly rather than degrading a
+recording permanently.
+
+### Lookahead
+
+Position-mode servos trail a moving target by a roughly fixed time, so replay
+reads the trajectory slightly ahead to cancel it. Measured on a 6s sweep, mean
+error against the commanded trajectory across all six joints:
+
+| Lookahead | Mean lag | Worst |
+| --- | --- | --- |
+| 0.00s | 2.09 deg | 9.29 |
+| 0.05s | 1.52 deg | 7.19 |
+| 0.10s | 1.01 deg | 5.57 |
+| 0.15s | 0.70 deg | 5.31 |
+
+`REPLAY_LOOKAHEAD` defaults to **0.10s** -- a measured 2x improvement, staying
+short of the largest value tested since a hand demo has sharper reversals than
+the smooth sweep this was tuned on. The gripper lags most (it is the slowest
+geared), which is why it dominates the worst-case column.
+
+Replay always eases into the demo's first pose over 2s before starting the
+clock, since the arm may be nowhere near where the demonstration began.
+
+### Robustness
+
+The Feetech bus drops the occasional status packet. Two fixes came out of
+hitting this repeatedly:
+
+- **The poll loop survives it.** A single failed read used to kill the poller
+  thread and leave the server permanently dead while still serving HTTP. Now
+  transient failures are absorbed and logged, and only 25 consecutive failures
+  are fatal.
+- **Connect retries.** Startup retries 3 times, 3s apart, which covers both a
+  previous server still releasing the port and a bus glitch after a hard kill.
+
+The connect error message also distinguishes the two causes now, because they
+look identical but have opposite fixes -- kill a process, versus just wait. The
+old message blamed contention for everything and would send you hunting a
+process that was not there.
+
+`recordings/` is gitignored: demonstrations are yours, not part of the project.
+
 ## Troubleshooting
 
 **Nothing responds to `scan_bus.py`, but the COM port exists.** The port comes
@@ -545,5 +611,6 @@ Note that `pkill` from Git Bash does **not** reliably kill these -- use
 | [arm.py](arm.py) | Shared connect / read / interpolated-move helpers |
 | [move_ee.py](move_ee.py) | Cartesian tool moves and gripper control |
 | [pick_place.py](pick_place.py) | Shuttle an object between configured positions |
-| [server.py](server.py) | Live web GUI server (read-only, torque off) |
+| [server.py](server.py) | Live web GUI server: monitor, waypoints, demonstrations |
+| [demos.py](demos.py) | Storage and playback maths for demonstrations |
 | [web/index.html](web/index.html) | three.js front end for the monitor |

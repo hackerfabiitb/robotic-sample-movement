@@ -33,6 +33,7 @@ from pathlib import Path
 import numpy as np
 
 import arm
+import demos
 from kinematics import ARM_JOINTS, SO101Kinematics, pose_matrix, quat_from_matrix
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -45,6 +46,10 @@ T_GRIPPER = 0.5
 GRIP_SETTLE = 0.3
 RAMP_RATE = 30.0
 MAX_STEP = 12.0
+
+# Seconds to read the demo trajectory ahead of the clock during replay, to
+# offset servo lag. Tuned by measurement -- see README "Teach by demonstration".
+REPLAY_LOOKAHEAD = 0.10
 
 _state: dict = {
     "connected": False,
@@ -59,6 +64,14 @@ _state: dict = {
     # Waypoints record orientation as well as position; this decides whether
     # playback tries to reproduce it.
     "match_orientation": True,
+    # Hand-demonstrated trajectories: record by back-driving, then replay.
+    "recording": False,
+    "record_name": "",
+    "record_samples": 0,
+    "record_duration": 0.0,
+    "recordings": [],
+    "replaying": None,
+    "replay_progress": 0.0,
     "log": [],
     "running_index": None,
 }
@@ -66,6 +79,13 @@ _state_lock = threading.Lock()
 _commands: queue.Queue = queue.Queue()
 _stop = threading.Event()
 _abort = threading.Event()
+
+# Written only by the poller thread while a demonstration is being captured.
+_rec: dict = {"active": False, "t0": 0.0, "samples": [], "name": ""}
+
+
+# Everything the arm has, gripper included: the demo is replayed verbatim.
+RECORD_JOINTS = ARM_JOINTS + ["gripper"]
 
 
 def log(msg: str) -> None:
@@ -114,26 +134,66 @@ def persist() -> None:
     WAYPOINT_FILE.write_text(json.dumps(data, indent=2))
 
 
-def port_busy_hint(port: str, e: Exception) -> str:
-    """Explain a failure to OPEN the serial port, which is nearly always contention.
+def connect_failure_hint(port: str, e: Exception) -> str:
+    """Explain a failed connect, distinguishing the two causes that look alike.
 
-    A serial port is exclusive on Windows, so a second opener is simply refused.
-    lerobot reports this as 'Could not connect on port ... try lerobot-find-port',
-    which sends you looking for the wrong problem when the port is perfectly fine
-    and merely taken.
+    Port contention and a flaky bus both surface as an exception out of connect,
+    but the fixes are opposite: kill a process, versus just try again. Blaming
+    contention for a comms glitch sends you hunting a process that isn't there.
     """
+    msg = str(e)
+    contention = "could not connect on port" in msg.lower() or "access is denied" in msg.lower()
+
+    if contention:
+        return "\n".join([
+            f"could not OPEN {port}: {e}",
+            "",
+            f"{port} exists but is already held by another process -- most often an",
+            "earlier server.py still running in another terminal. A serial port is",
+            "exclusive on Windows, so the second opener just gets refused.",
+            "",
+            "Find and stop it with:",
+            '  Get-CimInstance Win32_Process -Filter "Name LIKE \'%python%\'" |',
+            "      Select-Object ProcessId, CommandLine",
+            "  Stop-Process -Id <pid> -Force",
+            "",
+            "Note that `pkill` from Git Bash does NOT reliably kill these.",
+        ])
+
     return "\n".join([
-        f"could not OPEN {port}: {e}",
+        f"{port} opened, but talking to the servos failed: {e}",
         "",
-        f"{port} exists but is already held by another process -- most often an",
-        "earlier server.py still running in another terminal. A serial port is",
-        "exclusive on Windows, so the second opener just gets refused.",
+        "This is a bus comms glitch, not port contention -- retrying usually",
+        "clears it. It shows up most often right after another process was",
+        "killed mid-transaction, so give it a few seconds first.",
         "",
-        "Find and stop it with:",
-        '  Get-CimInstance Win32_Process -Filter "Name LIKE \'%python%\'" |',
-        "      Select-Object ProcessId, CommandLine",
-        "  Stop-Process -Id <pid> -Force",
+        "If it persists, check the 12V supply and the 3-pin daisy-chain: a",
+        "marginal connection produces exactly this.",
     ])
+
+
+def connect_with_retry(port: str, robot_id: str, attempts: int = 3):
+    """Connect, retrying transient bus errors but failing fast on contention.
+
+    Killing a process mid-transaction can leave the servo bus briefly unable to
+    complete a handshake. That clears on its own, so it is worth a retry -- but
+    a held port never will be, so there is no point waiting on it.
+    """
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return arm.connect(port, robot_id, max_step=MAX_STEP)
+        except Exception as e:
+            last = e
+            if attempt < attempts:
+                # Both causes are usually transient when they happen at startup:
+                # a previous server may still be releasing the port, and a bus
+                # glitch clears on its own. Only give up after several tries.
+                busy = "could not connect on port" in str(e).lower()
+                why = "port still held" if busy else "bus glitch"
+                log(f"connect attempt {attempt}/{attempts} failed ({why}); retrying in 3s")
+                time.sleep(3.0)
+    raise RuntimeError(connect_failure_hint(port, last)) from last
 
 
 def publish(robot, kin: SO101Kinematics, mode: str, running_index=None) -> dict[str, float]:
@@ -286,6 +346,65 @@ def run_sequence(robot, kin: SO101Kinematics, waypoints: list[dict],
         log("torque OFF -- back-drivable again")
 
 
+def replay_demo(robot, kin: SO101Kinematics, name: str, speed: float, cycles: int,
+                lookahead: float = REPLAY_LOOKAHEAD) -> None:
+    """Replay a hand-demonstrated trajectory with torque on.
+
+    Joint angles go back verbatim, so the arm reproduces exactly what was shown
+    -- no IK, so no chance of picking a different elbow configuration or failing
+    on a pose the demonstration passed through happily.
+    """
+    data = demos.load_recording(name)
+    if not data or not data.get("samples"):
+        log(f"ABORT: recording '{name}' is missing or empty")
+        return
+
+    joint_names = data.get("joints", RECORD_JOINTS)
+    # Position-mode servos trail a moving target by a roughly fixed time, so
+    # reading the trajectory slightly ahead cancels most of that lag.
+    lookahead = float(lookahead)
+    arr = demos.smooth_samples(data["samples"])
+    duration = float(arr[-1, 0])
+    speed = max(0.1, min(4.0, float(speed)))
+
+    log(f"torque ON -- replaying '{name}' ({duration:.1f}s at {speed:g}x) x{cycles}")
+    robot.bus.enable_torque()
+    robot.send_action({f"{k}.pos": v for k, v in arm.read_joints(robot).items()})
+    time.sleep(0.1)
+
+    try:
+        # Ease into the demo's first pose before starting the clock; the arm is
+        # wherever you left it, which may be nowhere near where the demo began.
+        first = demos.resample(arr, 0.0)
+        log("  -> moving to the start of the demonstration")
+        ramp(robot, kin, dict(zip(joint_names, first)), 2.0)
+
+        period = 1.0 / RAMP_RATE
+        for c in range(1, cycles + 1):
+            log(f"  cycle {c}/{cycles}")
+            t0 = time.perf_counter()
+            while True:
+                if _abort.is_set():
+                    log("aborted")
+                    return
+                elapsed = (time.perf_counter() - t0) * speed
+                if elapsed > duration:
+                    break
+                target = demos.resample(arr, min(elapsed + lookahead, duration))
+                robot.send_action({f"{n}.pos": float(v) for n, v in zip(joint_names, target)})
+                with _state_lock:
+                    _state["replay_progress"] = round(elapsed / duration, 3)
+                publish(robot, kin, "running")
+                time.sleep(period)
+        log("replay complete")
+    finally:
+        with _state_lock:
+            _state["replaying"] = None
+            _state["replay_progress"] = 0.0
+        robot.bus.disable_torque()
+        log("torque OFF -- back-drivable again")
+
+
 def poll_arm(port: str, robot_id: str, rate: float) -> None:
     """Own the robot: monitor continuously, and execute queued commands."""
     kin = SO101Kinematics()
@@ -297,7 +416,7 @@ def poll_arm(port: str, robot_id: str, rate: float) -> None:
         try:
             missing = arm.preflight(port, timeout=0.0)
         except Exception as e:
-            raise RuntimeError(port_busy_hint(port, e)) from e
+            raise RuntimeError(connect_failure_hint(port, e)) from e
 
         if missing:
             with _state_lock:
@@ -307,37 +426,68 @@ def poll_arm(port: str, robot_id: str, rate: float) -> None:
                 )
             return
 
-        try:
-            robot = arm.connect(port, robot_id, max_step=MAX_STEP)
-        except Exception as e:
-            raise RuntimeError(port_busy_hint(port, e)) from e
+        robot = connect_with_retry(port, robot_id)
 
         robot.bus.disable_torque()
         saved = load_saved()
         with _state_lock:
             _state.update(saved)
+            _state["recordings"] = demos.list_recordings()
             _state["error"] = None
         log("connected -- torque OFF, arm is back-drivable")
 
         period = 1.0 / rate
+        # The Feetech bus drops the odd status packet. A single bad read used to
+        # kill this thread and take the whole server with it, so transient
+        # failures are absorbed and only a sustained run of them is fatal.
+        MAX_CONSECUTIVE_FAILURES = 25
+        failures = 0
+
         while not _stop.is_set():
             t0 = time.perf_counter()
 
             try:
-                cmd = _commands.get_nowait()
-            except queue.Empty:
-                cmd = None
+                try:
+                    cmd = _commands.get_nowait()
+                except queue.Empty:
+                    cmd = None
 
-            if cmd is not None:
-                handle_command(cmd, robot, kin)
+                if cmd is not None:
+                    handle_command(cmd, robot, kin)
 
-            publish(robot, kin, "monitor")
+                joints = publish(robot, kin, "recording" if _rec["active"] else "monitor")
+
+                if _rec["active"]:
+                    _rec["samples"].append(
+                        [time.perf_counter() - _rec["t0"]] + [joints[n] for n in RECORD_JOINTS])
+                    with _state_lock:
+                        _state["record_samples"] = len(_rec["samples"])
+                        _state["record_duration"] = round(_rec["samples"][-1][0], 2)
+
+                if failures:
+                    log(f"bus recovered after {failures} failed cycle(s)")
+                    failures = 0
+            except Exception as e:
+                failures += 1
+                if failures == 1:
+                    log(f"bus glitch ({type(e).__name__}) -- retrying")
+                if failures >= MAX_CONSECUTIVE_FAILURES:
+                    raise RuntimeError(
+                        f"bus unusable: {failures} consecutive failures, last was {e}. "
+                        "Check the 12V supply and the 3-pin daisy-chain."
+                    ) from e
+                time.sleep(0.1)
+                continue
             time.sleep(max(0.0, period - (time.perf_counter() - t0)))
     except Exception as e:
         with _state_lock:
             _state["error"] = f"{type(e).__name__}: {e}"
             _state["connected"] = False
     finally:
+        if _rec["active"] and len(_rec["samples"]) >= 5:
+            demos.save_recording(_rec["name"], RECORD_JOINTS, _rec["samples"])
+            print("saved in-progress recording before shutdown")
+        _rec["active"] = False
         if robot is not None:
             try:
                 robot.disconnect()
@@ -406,6 +556,59 @@ def handle_command(cmd: dict, robot, kin: SO101Kinematics) -> None:
             _state[key] = value
         persist()
         log(f"{key.replace('_', ' ')} set to {value:.0f}")
+
+    elif action == "record_start":
+        if _rec["active"]:
+            log("already recording")
+        else:
+            robot.bus.disable_torque()  # must be back-drivable to demonstrate
+            _rec.update(active=True, t0=time.perf_counter(), samples=[],
+                        name=cmd.get("name") or "")
+            with _state_lock:
+                _state.update(recording=True, record_name=_rec["name"],
+                              record_samples=0, record_duration=0.0)
+            log("RECORDING -- move the arm through the task, then press stop")
+
+    elif action == "record_stop":
+        if not _rec["active"]:
+            log("not recording")
+        else:
+            _rec["active"] = False
+            samples = _rec["samples"]
+            with _state_lock:
+                _state.update(recording=False, record_samples=0, record_duration=0.0)
+            if len(samples) < 5:
+                log("discarded -- too short to be a demonstration")
+            else:
+                slug = demos.save_recording(_rec["name"], RECORD_JOINTS, samples)
+                with _state_lock:
+                    _state["recordings"] = demos.list_recordings()
+                log(f"saved '{slug}': {len(samples)} samples over {samples[-1][0]:.1f}s")
+
+    elif action == "delete_recording":
+        if demos.delete_recording(cmd.get("name", "")):
+            with _state_lock:
+                _state["recordings"] = demos.list_recordings()
+            log(f"deleted recording '{cmd.get('name')}'")
+
+    elif action == "replay":
+        _abort.clear()
+        name = cmd.get("name", "")
+        with _state_lock:
+            _state["replaying"] = name
+        try:
+            replay_demo(robot, kin, name, float(cmd.get("speed", 1.0)),
+                        int(cmd.get("cycles", 1)),
+                        float(cmd.get("lookahead", REPLAY_LOOKAHEAD)))
+        except Exception as e:
+            log(f"replay failed: {type(e).__name__}: {e}")
+            try:
+                robot.bus.disable_torque()
+            except Exception:
+                pass
+        finally:
+            with _state_lock:
+                _state["replaying"] = None
 
     elif action == "set_match_orientation":
         with _state_lock:
