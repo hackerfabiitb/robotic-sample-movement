@@ -8,6 +8,10 @@ teach-by-demonstration.
 [**Demo: moving wafer using its holder between beakers**](https://www.youtube.com/shorts/06ecVcR53Uo?feature=share)
 — by Aryamman on Aug 22 2026
 
+<a href="https://youtu.be/WDfGkfzMThQ?t=53"><img src="parallel_gripper.png" width="420" alt="A parallel gripper lifting a thin plate off a fixture"></a>
+
+[**Parallel Gripper TODO**](https://youtu.be/WDfGkfzMThQ?t=53)
+
 ---
 
 ## Quickstart
