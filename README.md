@@ -5,6 +5,9 @@ Control software for an [SO-101](https://huggingface.co/docs/lerobot/so101) arm
 Cartesian control with our own inverse kinematics, waypoint sequences, and
 teach-by-demonstration.
 
+[**Demo: moving wafer using its holder between beakers**](https://www.youtube.com/shorts/06ecVcR53Uo?feature=share)
+— by Aryamman on Aug 22 2026
+
 ---
 
 ## Quickstart
