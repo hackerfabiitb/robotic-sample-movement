@@ -1,0 +1,17 @@
+Calibration saved to C:\Users\Admin\.cache\huggingface\lerobot\calibration\robots\so_follower\arm0.json
+
+
+
+-188.6, 114.5
+
+left:
+-78.8, -31.325
+-78.8, -52.575
+
+bottom:
+31.325, -67.8
+52.575, -67.8
+
+right: 
+77.25, 19.625
+77.25, -1.625
