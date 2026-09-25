@@ -665,11 +665,11 @@ pixel into a reachable position. [calibrate_camera.py](calibrate_camera.py)
 fits that mapping, and [pick_box.py](pick_box.py) uses it.
 
 A full run, both cameras, recorded live:
-[**both views stacked**](media/pick_and_place_stacked.mp4) — 50 s, picking a
+[**both views stacked**](media/pick_and_place_stacked.mp4) — 29 s, picking a
 transparent box off the bench and setting it on the red mat, overhead on top and
-wrist below. The separate
+wrist below. Trimmed to the part where something happens; the full 50 s runs,
 [overhead](media/pick_and_place_top.mp4) and
-[wrist](media/pick_and_place_wrist.mp4) clips are there too.
+[wrist](media/pick_and_place_wrist.mp4), are there uncut.
 
 ```powershell
 python calibrate_camera.py                  # ~8 min of arm time, writes camera_calib.json
@@ -753,7 +753,13 @@ ffmpeg -t 49.766667 -i media/pick_and_place_top.mp4 `
 ```
 
 `ffprobe -show_entries format=duration` on each input gives the length to trim
-to. The result is 640x960 and 5.5 MB.
+to. The result is 640x960. Cutting the dead time off either end is the same tool
+again — `-ss` and `-to` before `-i`, re-encoding rather than stream-copying so
+the cut lands on the requested frame instead of the nearest keyframe:
+
+```powershell
+ffmpeg -ss 14 -to 43 -i stacked.mp4 -c:v libx264 -crf 26 -pix_fmt yuv420p out.mp4
+```
 
 ### Measured behaviour
 
