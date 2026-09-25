@@ -665,10 +665,11 @@ pixel into a reachable position. [calibrate_camera.py](calibrate_camera.py)
 fits that mapping, and [pick_box.py](pick_box.py) uses it.
 
 A full run, both cameras, recorded live:
-[**overhead**](media/pick_and_place_top.mp4) ·
-[**wrist**](media/pick_and_place_wrist.mp4) — 50 s, picking a transparent box
-off the bench and setting it on the red mat. Both clips share one timeline, so
-they can be watched side by side.
+[**both views stacked**](media/pick_and_place_stacked.mp4) — 50 s, picking a
+transparent box off the bench and setting it on the red mat, overhead on top and
+wrist below. The separate
+[overhead](media/pick_and_place_top.mp4) and
+[wrist](media/pick_and_place_wrist.mp4) clips are there too.
 
 ```powershell
 python calibrate_camera.py                  # ~8 min of arm time, writes camera_calib.json
@@ -735,6 +736,24 @@ arm. Two details it gets wrong if written naively:
 A recording owns both cameras while it runs -- DirectShow will not hand the same
 device to a second process -- so stills come from `Recorder.snapshot()` rather
 than from `jog.py`. 640x480 at CRF 26 keeps a 50 s run to ~3.5 MB per camera.
+
+The two clips are written independently and end a fraction of a second apart,
+because `stop()` closes them in turn. To put them in one frame, trim both to the
+shorter and stack. They start together, so trimming from the front keeps them in
+step:
+
+```powershell
+winget install --id Gyan.FFmpeg -e        # ffmpeg is not otherwise needed
+
+ffmpeg -t 49.766667 -i media/pick_and_place_top.mp4 `
+       -t 49.766667 -i media/pick_and_place_wrist.mp4 `
+       -filter_complex "[0:v][1:v]vstack=inputs=2[v]" -map "[v]" `
+       -c:v libx264 -crf 26 -preset medium -pix_fmt yuv420p `
+       media/pick_and_place_stacked.mp4
+```
+
+`ffprobe -show_entries format=duration` on each input gives the length to trim
+to. The result is 640x960 and 5.5 MB.
 
 ### Measured behaviour
 
