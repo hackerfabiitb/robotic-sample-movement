@@ -4,3 +4,5 @@ __pycache__/
 waypoints.json
 out0.txt
 recordings/
+datasets/
+outputs/

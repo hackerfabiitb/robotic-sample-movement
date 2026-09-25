@@ -77,12 +77,13 @@ see [Why not lerobot's solver](#why-not-lerobots-solver).
 | [pick_place.py](pick_place.py) | CLI: shuttle an object between hard-coded positions |
 | [move_middle.py](move_middle.py) | CLI: send every joint to its calibrated midpoint |
 | [scan_bus.py](scan_bus.py) | CLI: report which motor IDs and baud rates are live |
+| [record_dataset.py](record_dataset.py) | CLI: record a LeRobot dataset by hand, with both cameras |
 | [urdf/](urdf/) | Official SO-101 URDF from TheRobotStudio/SO-ARM100 |
 | [requirements.txt](requirements.txt) | Pinned dependency set |
 | [activate.ps1](activate.ps1) | Dot-source to activate `.venv` |
 
-Not tracked (gitignored): `.venv/`, `waypoints.json`, `recordings/`. The last
-two are your data, not project content.
+Not tracked (gitignored): `.venv/`, `waypoints.json`, `recordings/`,
+`datasets/`, `outputs/`. Those are your data, not project content.
 
 ---
 
@@ -194,6 +195,63 @@ python pick_place.py                        # hard-coded shuttle (config at top 
 
 Coordinates are metres in `base_link`: **+X forward** out of the base, **+Z up**,
 origin at the base plate. `move_ee.py --show` is the quick way to get bearings.
+
+---
+
+## Recording datasets
+
+Two Lenovo FHD webcams are mounted on this rig: one overhead looking down at the
+bench, one on the wrist. `lerobot-find-cameras opencv` enumerates them as
+
+| Index | View | Observation key |
+| --- | --- | --- |
+| 0 | overhead, whole bench | `observation.images.top` |
+| 1 | wrist, sees both jaws | `observation.images.wrist` |
+
+Measured on this machine, DSHOW backend, **MJPG**: each camera holds 30 fps on
+its own and **both together hold 30 fps even at 1920x1080**. The default YUY2 is
+uncompressed and does not fit two streams through one USB controller — set
+`fourcc="MJPG"` or expect stalls. A full observation (6 joints + 2 frames) reads
+at **659 Hz**, so 30 fps recording has 20x headroom.
+
+### Why not `lerobot-record`
+
+The stock command refuses to start:
+
+```
+A teleoperator is required for recording. Use --teleop.type=... to specify one.
+```
+
+Every arm teleoperator lerobot ships is a *separate leader device on its own
+serial port*, and this rig has one arm. There is no built-in "read the follower
+itself" teleoperator.
+
+[record_dataset.py](record_dataset.py) supplies one. It switches torque **off**,
+so you pose the arm by hand, and reports the follower's present position as the
+action. Everything else is lerobot's own code — `record_loop`, `LeRobotDataset`,
+the video encoder and the keyboard controls all run unmodified.
+
+```powershell
+python record_dataset.py --repo-id local/wafer --task "Move the wafer" `
+    --episodes 5 --episode-time 30
+```
+
+During an episode: **right arrow** finishes it early, **left arrow** re-records
+it, **ESC** stops the session. Between episodes there is a reset window (default
+10s) that is not recorded, for putting the scene back.
+
+The dataset lands in `datasets/<name>/` (gitignored) in standard LeRobot layout —
+a parquet of states and actions plus one AV1 MP4 per camera — and loads straight
+back with `LeRobotDataset`. Add `--push-to-hub` to upload, `--resume` to append.
+
+That the recorded action equals the observed state is inherent to teaching by
+hand: with no motor holding a target, the position the arm reached *is* the
+command. This is the same demonstration data as
+[Teach by demonstration](#teach-by-demonstration), but in LeRobot's training
+format and with camera frames, rather than this repo's own joint-only recordings.
+
+**The arm is limp for the whole session**, between episodes included. It sags if
+you let go of it in mid-air.
 
 ---
 
@@ -499,6 +557,26 @@ Startup retries 3 times, 3s apart, and the poll loop absorbs transient failures
 during monitoring — only 25 consecutive failures are fatal. If it happens on
 *every* attempt rather than occasionally, suspect the 12V supply or a marginal
 3-pin connection.
+
+**`ImportError: DLL load failed while importing _imaging`.** Pillow was installed
+by **conda**, not pip, and the conda build does not load in this env — the same
+class of breakage as the numpy/MKL one above. Nothing in the repo imported it
+until the dataset work pulled in torchvision, so it sat there unnoticed. Check
+the installer and replace it with pip's build:
+
+```powershell
+type .venv\Lib\site-packages\pillow-*.dist-info\INSTALLER   # "conda" = broken
+.\.venv\python.exe -m pip install --force-reinstall --no-deps pillow
+```
+
+Leftovers from the abandoned placo attempt (`casadi`, `meshcat`, `pyngrok`) came
+in the same way. They are inert, but if an import fails oddly, check `INSTALLER`
+first.
+
+**`'torchcodec' is installed but cannot be loaded ... Falling back to 'pyav'`.**
+Harmless. `libtorchcodec_core4.dll` will not load against this torch build, and
+pyav decodes the dataset videos correctly — only slower. Recording does not use
+it at all; it appears when you *read* a dataset back.
 
 **Gripper will not hold an object.** The follower caps gripper torque at 50% and
 `Overload_Torque` at 25% to avoid burning the servo out. An
