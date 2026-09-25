@@ -664,6 +664,12 @@ Locating something the arm has never been told about means turning a camera
 pixel into a reachable position. [calibrate_camera.py](calibrate_camera.py)
 fits that mapping, and [pick_box.py](pick_box.py) uses it.
 
+A full run, both cameras, recorded live:
+[**overhead**](media/pick_and_place_top.mp4) ·
+[**wrist**](media/pick_and_place_wrist.mp4) — 50 s, picking a transparent box
+off the bench and setting it on the red mat. Both clips share one timeline, so
+they can be watched side by side.
+
 ```powershell
 python calibrate_camera.py                  # ~8 min of arm time, writes camera_calib.json
 python calibrate_camera.py --check          # residuals of the saved fit, moves nothing
@@ -672,6 +678,7 @@ python probe.py                             # where is the jaw, in pixels and in
 python pick_box.py --dry-run                # plan the pick, move nothing
 python pick_box.py --approach-only          # stop with the jaws around the object
 python pick_box.py
+python pick_box.py --record media           # ...and film it from both cameras
 ```
 
 `jog.py` steps the arm to one Cartesian target and photographs both cameras —
@@ -710,6 +717,24 @@ the *midpoint between the jaw tips* lands on the target instead.
 An object also does not end up exactly at the grip centre — it settles toward
 the fixed jaw as the other closes. Measured 28mm for the box here, so the place
 target is offset by the same amount.
+
+### Recording it
+
+[video.py](video.py) films both cameras to H.264 while something else drives the
+arm. Two details it gets wrong if written naively:
+
+- **Sample on an absolute wall-clock schedule**, not a fixed sleep between
+  grabs. Left to drift the two loops ran at 51 and 32 fps over the same five
+  seconds, so the clips played at different speeds and neither matched what the
+  arm did. If a frame is missed the counter advances to real time rather than
+  emitting a burst of catch-up frames.
+- **Open both cameras before starting either thread.** Connecting a camera takes
+  seconds, so opening and starting each in turn left the first clip running
+  three seconds ahead of the second.
+
+A recording owns both cameras while it runs -- DirectShow will not hand the same
+device to a second process -- so stills come from `Recorder.snapshot()` rather
+than from `jog.py`. 640x480 at CRF 26 keeps a 50 s run to ~3.5 MB per camera.
 
 ### Measured behaviour
 

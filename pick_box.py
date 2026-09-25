@@ -29,6 +29,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -39,13 +40,20 @@ import arm
 from jog import FREE_JOINTS, SAFE_ROLL, ik_fixed_roll, shoot
 from kinematics import ARM_JOINTS, SO101Kinematics
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+from video import Recorder
 
 CALIB_FILE = Path(__file__).parent / "camera_calib.json"
 
 # Pixel positions read off the overhead camera, converted to the table plane by
 # the fitted projective camera (see calibrate_camera.py).
-BOX_PIXEL = (757.0, 333.0)
-MAT_PIXEL = (895.0, 205.0)
+BOX_PIXEL = (756.0, 347.0)
+MAT_PIXEL = (903.0, 208.0)
+
+# An object does not end up at the grip centre: the moving jaw pushes it toward
+# the fixed one as it closes, so it settles to one side. Measured by placing the
+# box and seeing where it landed -- 28mm, which is most of the mat. The place
+# target is shifted by this so the box, not the gripper, lands on the mark.
+BOX_SETTLE_OFFSET = np.array([0.0261, -0.0106])
 
 BOX_HEIGHT = 0.020        # the box stands about this tall
 MAT_THICKNESS = 0.004     # the mat it has to clear on the way down
@@ -171,6 +179,10 @@ def main() -> int:
                         help="override the box x y in metres")
     parser.add_argument("--mat", nargs=2, type=float, default=None)
     parser.add_argument("--grip", type=float, default=GRIP_CLOSE)
+    parser.add_argument("--record", default=None,
+                        help="record both cameras to this directory while running")
+    parser.add_argument("--no-settle-offset", action="store_true",
+                        help="aim the grip centre at the mat, not the object")
     parser.add_argument("--steps", type=int, default=5,
                         help="sub-moves for long travels, to hold the IK branch")
     parser.add_argument("--port", default=arm.DEFAULT_PORT)
@@ -185,6 +197,9 @@ def main() -> int:
            pixel_to_plane(P, *BOX_PIXEL, z=BOX_HEIGHT * 0.5))
     mat = (np.array([*args.mat, 0.0]) if args.mat else
            pixel_to_plane(P, *MAT_PIXEL, z=0.0))
+    if not args.no_settle_offset:
+        mat = np.array([mat[0] - BOX_SETTLE_OFFSET[0],
+                        mat[1] - BOX_SETTLE_OFFSET[1], mat[2]])
     # Set the box down with its base just clear of the mat, then let go.
     place = np.array([mat[0], mat[1], MAT_THICKNESS + BOX_HEIGHT * 0.5 + 0.004])
 
@@ -196,6 +211,15 @@ def main() -> int:
         disable_torque_on_disconnect=False))
     if not args.dry_run:
         robot.connect(calibrate=False)
+
+    # While a recording runs it owns both cameras -- DirectShow will not hand
+    # the same device to a second process -- so stills have to come from the
+    # recorder's own frames rather than from jog.shoot().
+    recorder = Recorder(args.record) if (args.record and not args.dry_run) else None
+    capture = recorder.snapshot if recorder else shoot
+    stack = contextlib.ExitStack()
+    if recorder is not None:
+        stack.enter_context(recorder)
     try:
         if args.dry_run:
             q = np.array([9.0, -50.0, 75.0, 20.0, SAFE_ROLL])
@@ -216,7 +240,7 @@ def main() -> int:
         # separate process cannot be used to check the pose: connecting sags the
         # arm, so the picture would show something other than what was reached.
         if not args.dry_run:
-            shoot("approach")
+            capture("approach")
         if args.approach_only:
             print("stopping before the grip -- check the jaws straddle the box")
             return 0
@@ -226,18 +250,19 @@ def main() -> int:
         q = move(robot, kin, "across to the mat", [mat[0], mat[1], Z_LIFT],
                  args.grip, q, duration=4.0, dry=args.dry_run, steps=args.steps)
         if not args.dry_run:
-            shoot("over_mat")
+            capture("over_mat")
         q = move(robot, kin, "down onto the mat", place, args.grip, q,
                  duration=2.0, dry=args.dry_run, steps=2)
         jaw(robot, GRIP_OPEN, "release", args.dry_run)
         q = move(robot, kin, "back off", [mat[0], mat[1], Z_HOVER], GRIP_OPEN, q,
                  duration=2.0, dry=args.dry_run, steps=2)
         if not args.dry_run:
-            shoot("placed")
+            capture("placed")
         print("done -- torque left on, arm parked above the mat")
     finally:
         if not args.dry_run:
             robot.disconnect()
+        stack.close()          # flush and close the video files
     return 0
 
 
