@@ -476,6 +476,23 @@ Stop-Process -Id <pid> -Force
 
 `pkill` from Git Bash does **not** reliably kill these — use `Stop-Process`.
 
+**The GUI loads but the arm reads as not connected — and the port is free.** A
+`server.py` whose startup retries were all used up keeps serving HTTP with no
+robot behind it. The browser still finds a page at <http://localhost:8000>, so it
+looks like the arm is undetected, but the serial port was released and the entry
+above sends you hunting for a holder that no longer exists. Confirm the motors
+are fine, then kill the dead server by the port it still owns:
+
+```powershell
+.\.venv\python.exe scan_bus.py          # all six ids should answer
+Get-NetTCPConnection -LocalPort 8000 -State Listen | Select-Object OwningProcess
+Stop-Process -Id <pid> -Force
+```
+
+Restarting `server.py` then connects on the first attempt. Look for the startup
+line `connected -- torque OFF, arm is back-drivable`; without it, the server is
+in this dead state no matter what the page shows.
+
 **`connect attempt 1/3 failed (bus glitch)`.** The Feetech bus drops the odd
 status packet, most often right after a process was killed mid-transaction.
 Startup retries 3 times, 3s apart, and the poll loop absorbs transient failures
