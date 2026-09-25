@@ -77,7 +77,7 @@ see [Why not lerobot's solver](#why-not-lerobots-solver).
 | [pick_place.py](pick_place.py) | CLI: shuttle an object between hard-coded positions |
 | [move_middle.py](move_middle.py) | CLI: send every joint to its calibrated midpoint |
 | [scan_bus.py](scan_bus.py) | CLI: report which motor IDs and baud rates are live |
-| [record_dataset.py](record_dataset.py) | CLI: record a LeRobot dataset by hand, with both cameras |
+| [record_dataset.py](record_dataset.py) | CLI: record a LeRobot dataset, hand-guided or self-driven |
 | [urdf/](urdf/) | Official SO-101 URDF from TheRobotStudio/SO-ARM100 |
 | [requirements.txt](requirements.txt) | Pinned dependency set |
 | [activate.ps1](activate.ps1) | Dot-source to activate `.venv` |
@@ -226,32 +226,99 @@ Every arm teleoperator lerobot ships is a *separate leader device on its own
 serial port*, and this rig has one arm. There is no built-in "read the follower
 itself" teleoperator.
 
-[record_dataset.py](record_dataset.py) supplies one. It switches torque **off**,
-so you pose the arm by hand, and reports the follower's present position as the
-action. Everything else is lerobot's own code — `record_loop`, `LeRobotDataset`,
-the video encoder and the keyboard controls all run unmodified.
+[record_dataset.py](record_dataset.py) supplies one — in fact two, chosen with
+`--source`. Everything else is lerobot's own code: `record_loop`,
+`LeRobotDataset`, the video encoder and the keyboard controls run unmodified.
+
+During any episode: **right arrow** finishes it early, **left arrow** re-records
+it, **ESC** stops the session. The dataset lands in `datasets/<name>/`
+(gitignored) in standard LeRobot layout — a parquet of states and actions plus
+one AV1 MP4 per camera — and loads straight back with `LeRobotDataset`. Add
+`--push-to-hub` to upload, `--resume` to append.
+
+### `--source hand` — pose it yourself
+
+Torque **off**, arm limp, present position reported as the action.
 
 ```powershell
-python record_dataset.py --repo-id local/wafer --task "Move the wafer" `
-    --episodes 5 --episode-time 30
+python record_dataset.py --source hand --episode-time 30 --episodes 5
 ```
 
-During an episode: **right arrow** finishes it early, **left arrow** re-records
-it, **ESC** stops the session. Between episodes there is a reset window (default
-10s) that is not recorded, for putting the scene back.
+Action and state come out identical, which is inherent to kinesthetic teaching:
+with no motor holding a target, the position the arm reached *is* the command.
+Between episodes there is a reset window (default 10s) that is not recorded.
+**The arm is limp for the whole session** and sags if you let go of it mid-air.
 
-The dataset lands in `datasets/<name>/` (gitignored) in standard LeRobot layout —
-a parquet of states and actions plus one AV1 MP4 per camera — and loads straight
-back with `LeRobotDataset`. Add `--push-to-hub` to upload, `--resume` to append.
+### `--source waypoints` / `recording:<name>` — the arm drives itself
 
-That the recorded action equals the observed state is inherent to teaching by
-hand: with no motor holding a target, the position the arm reached *is* the
-command. This is the same demonstration data as
-[Teach by demonstration](#teach-by-demonstration), but in LeRobot's training
-format and with camera frames, rather than this repo's own joint-only recordings.
+Torque **on**, arm playing a precomputed joint trajectory, nobody holding it.
+`waypoints` runs the saved GUI pick-and-place; `recording:<name>` replays one of
+the saved [demonstrations](#teach-by-demonstration).
 
-**The arm is limp for the whole session**, between episodes included. It sags if
-you let go of it in mid-air.
+```powershell
+python record_dataset.py --source waypoints --repo-id local/wafer `
+    --task "Move the wafer" --episodes 10 --jitter 0.005
+
+python record_dataset.py --source recording:wafer-station-3 --episodes 10
+```
+
+`--dry-run` plans the trajectory and prints its per-joint range and peak speed
+without moving anything. Always worth running first. `--jitter` offsets each
+waypoint by a few mm per episode, so a run produces varied data rather than ten
+identical passes. Episode length is derived from the trajectory, not guessed, so
+`--episode-time` is ignored here.
+
+Here `action` is the commanded setpoint and `observation.state` is where the
+servo actually got to — the more useful pair to train on.
+
+Note that none of the three saved `wafer-station` recordings move the gripper —
+it sits at 0.7–1.7 throughout, clamped on the holder for the whole demonstration.
+Replaying them gives arm motion but no grasping. Use `--source waypoints`, whose
+jaw sweeps 45 → 16, for data that includes opening and closing.
+
+### Making the arm actually follow the plan
+
+Three things had to change before a scripted episode tracked its own setpoints.
+Measured on the saved waypoint sequence, mean |action − state| per joint:
+
+| | shoulder_lift mean | max |
+| --- | --- | --- |
+| First working version | 25.8° | 84.5° |
+| After all three fixes | **2.9°** | **9.0°** |
+
+**Seed IK from the previous pose.** Solving `retract` from a fixed seed let IK
+return a *different elbow configuration* than the waypoints, so the arm swung
+between two branches of the same solution — 118° of shoulder_lift per 1.5s move.
+`server.goto_pose` never hits this because it seeds from wherever the arm is.
+
+**Turn `max_relative_target` off.** Counter-intuitively the safety cap made
+tracking twice as bad (12.6° → 25.8° mean): clamping the goal to present ±12°
+stops the servo ever being handed a target far enough ahead to catch up. Worse,
+`record_loop` stores the action the teleoperator *requested*, not the clamped one
+`send_action` sent ([lerobot_record.py:331](.venv/Lib/site-packages/lerobot/scripts/lerobot_record.py),
+with their own TODO beside it) — so a clamped frame records a command the arm
+never received. `check_plan_speed` guards the real risk instead, before the arm
+moves.
+
+**Raise `Acceleration` to 254 for playback.** arm.py's 24 is tuned to stop the
+arm jittering on slow GUI moves; here the goal is to hit the setpoint. Mean
+error by acceleration: 24 → 4.34°, 64 → 4.34°, 128 → 2.98°, 254 → 2.62°.
+
+A plan faster than `--max-speed` (default 60 deg/s) is stretched in time
+automatically. That number is where the curve flattens:
+
+| peak commanded speed | 136 | 91 | 68 | 45 deg/s |
+| --- | --- | --- | --- | --- |
+| mean error, all joints | 5.30° | 2.97° | 2.10° | 1.38° |
+
+What is left below that is **static droop** — shoulder_lift carrying the arm's
+weight against a proportional band of P=16 — not lag, so slowing further buys
+almost nothing and costs episode time. Raise `--max-speed` for shorter episodes
+if you are willing to trade tracking for throughput.
+
+**The arm moves on its own with nobody holding it.** Run `--dry-run` first,
+check the workspace is clear, and note that the session ends with torque off, so
+the arm sags from wherever the trajectory left it.
 
 ---
 
