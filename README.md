@@ -655,3 +655,66 @@ motors — they are all colliding on address 1. Run `lerobot-setup-motors`.
 
 **`lerobot-find-port` crashes with an EOF error.** It is interactive and needs a
 real terminal; it cannot run piped or from a script.
+
+---
+
+## Camera-guided pick and place
+
+Locating something the arm has never been told about means turning a camera
+pixel into a reachable position. [calibrate_camera.py](calibrate_camera.py)
+fits that mapping, and [pick_box.py](pick_box.py) uses it.
+
+```powershell
+python calibrate_camera.py                  # ~8 min of arm time, writes camera_calib.json
+python calibrate_camera.py --check          # residuals of the saved fit, moves nothing
+python calibrate_camera.py --refit          # refit the maths from saved raw data
+python probe.py                             # where is the jaw, in pixels and in metres
+python pick_box.py --dry-run                # plan the pick, move nothing
+python pick_box.py --approach-only          # stop with the jaws around the object
+python pick_box.py
+```
+
+`jog.py` steps the arm to one Cartesian target and photographs both cameras —
+the tool for working a new task out by hand.
+
+### Finding the gripper without eyeballing it
+
+The calibration needs to know where the tool is in the image. Rather than
+locate a gripper by colour or shape, it **opens and closes the jaw and subtracts
+the two frames**: the arm, the bench and the lighting are identical in both, so
+the only thing that survives is the jaw. Three cycles per point, median-filtered
+— a single difference cannot tell the jaw from anything else that moved in that
+half second, and on the first run one point locked onto activity at the far side
+of the bench and came out 400mm wrong.
+
+### Why a projective camera and not a homography
+
+A homography maps pixels to one plane. Fitted to the jaw sweeping at gripper
+height it describes *that* height, and an object lying on the bench is ~50mm
+below it — over a centimetre of parallax error. Sweeping at two heights makes
+the points non-coplanar, which determines a full 3x4 projection, and a pixel can
+then be back-projected onto the table specifically. Measured: **1.27 px
+reprojection, 1.18 mm back-projection**, against 3.6 mm for the single-plane fit.
+
+The world point is the midpoint of the jaw bar, chosen by leave-one-out
+cross-validation over four candidates. The tool point had the *lowest* in-sample
+residual and the worst held-out error (22 mm) — it was overfitting five points.
+
+### Aim the grip centre, not the tool point
+
+`fk_position` returns the tip of the **fixed** jaw, which is one side of the
+gripper. Driving it to an object leaves the object against one jaw with the
+other 35mm away. `pick_box.solve_for_grip` iterates the tool-point command until
+the *midpoint between the jaw tips* lands on the target instead.
+
+An object also does not end up exactly at the grip centre — it settles toward
+the fixed jaw as the other closes. Measured 28mm for the box here, so the place
+target is offset by the same amount.
+
+### Measured behaviour
+
+- The arm settles **~10-15mm low** under gravity. Each move re-measures and
+  re-aims, under-relaxed at 0.6 gain — at full gain it oscillates, because the
+  servos do not respond 1:1 once backlash is taken up.
+- Accuracy falls off to the far left of the workspace: placements landed within
+  2mm near the middle of the bench and ~10mm at full left reach.

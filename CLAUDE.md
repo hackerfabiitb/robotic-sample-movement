@@ -18,6 +18,29 @@ This repo drives a physical arm. Before anything that moves it:
   the motors have power.
 - Prefer `--dry-run` / read-only paths first where a script offers one.
 - A run ends with torque off, so the arm **drops** from wherever it stopped.
+- **Keep `wrist_roll` at about -99 deg** (`jog.SAFE_ROLL`). The wrist camera is
+  bolted to one side of the wrist, and that roll is what keeps it on the *upper*
+  side. Position-only IK treats roll as free and will return a solution ~99 deg
+  away, which rolls the camera underneath, where it strikes the arm — this has
+  already happened once. Use `jog.ik_fixed_roll`, not `kinematics.ik`, for
+  anything that moves the arm near the bench.
+- Two Cartesian points a short distance apart can solve to completely different
+  arm configurations (wrist_flex +63 deg vs -90 deg was measured). Seed IK from
+  the current pose, refuse large joint jumps, and split long travels into
+  sub-moves.
+
+## Connecting drops the arm
+
+`SO101Follower.connect()` calls `configure()`, which does its register writes
+inside `with self.bus.torque_disabled()`. The arm sags several centimetres every
+time a process connects, and **anything in the gripper is dropped**. So:
+
+- A pick-and-place must run start to finish in **one** process.
+- To attach to an arm that is already holding something, open the bus directly
+  (`robot.bus.connect()`) and skip `configure()` — see `pick_box.attach`.
+- `arm.tune_servos` drops torque for the same reason. Read the pose *before*
+  calling it and re-assert it afterwards, or the arm ratchets downward on every
+  command.
 
 ## Environment gotchas
 

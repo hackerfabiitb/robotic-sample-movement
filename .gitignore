@@ -6,3 +6,5 @@ out0.txt
 recordings/
 datasets/
 outputs/
+camera_calib.json
+camera_calib_raw.json
